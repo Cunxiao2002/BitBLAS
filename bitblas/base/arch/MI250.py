@@ -20,7 +20,3 @@ class MI250(TileDevice):
         self.platform: str = "ROCm-CDNA2"
         self.compute_capability: str = "gfx90a"
         self.target = tvm.target.Target("hip --mcpu=gfx90a")
-
-        
-
-        
