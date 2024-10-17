@@ -16,7 +16,7 @@ class RDNA(TileDevice):
             target = tvm.target.Target(target) 
         self.target = target
         self.gfx_version = check_gfx_version(self.target.arch)
-        #todo: device = tvm.runtime.rocm(0)
+        #?question: device = tvm.runtime.rocm(0)
         device = tvm.runtime.hip(0) 
         if not device.exist:
             raise RuntimeError("Cannot find HIP device 0.")
@@ -36,7 +36,3 @@ class RDNA(TileDevice):
         self.transaction_size: List[int] = [32, 128]  # in bytes
     
         self.bandwidth: List[int] = [1300, 14000]
-        #self.available_tensor_instructions: List[TensorInstruction] = None
-        # Todo: matrix core
-
-        #?device.multi_processor_count, device.warp_size,device.compute_version.replace(".", "")
