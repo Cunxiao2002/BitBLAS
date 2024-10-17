@@ -1,6 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 """Hint definition for schedule"""
+from tvm import DataType
 from typing import Dict, List, Tuple
 from . import PrimFuncNode
 import numpy as np
@@ -128,6 +129,9 @@ class IntrinInfo:
     def __repr__(self) -> str:
         return f"<IntrinInfo, {self.in_dtype}, {self.out_dtype}, {self.trans_b}, {self.propagate_b}>"
 
+    def is_input_8bit(self) -> bool:
+        return DataType(self.in_dtype).bits == 8
+
     @property
     def smooth_a(self) -> bool:
         return self.input_transform_kind >= 2
@@ -245,7 +249,8 @@ class Hint(object):
         # int32 and float32 accum may take too much shared memory
         if self.use_tc and self.intrin_info.out_dtype in ["float32", "int32"]:
             merge_static_smem = True
-        # Always merge static shared memory
-        merge_static_smem = False
+        # Always merge dynamic shared memory
+        if self.shared_scope == "shared.dyn":
+            merge_static_smem = True
         self.pass_context = {"tir.merge_static_smem": merge_static_smem}
         return self

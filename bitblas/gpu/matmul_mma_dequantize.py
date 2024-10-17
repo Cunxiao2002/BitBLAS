@@ -9,7 +9,7 @@ from contextlib import suppress
 from tvm import tir, DataType
 from tvm.target import Target
 
-from ..ops.operator import TransformKind
+from ..ops.common import TransformKind
 from ..base.roller.hint import Hint, IntrinInfo
 from ..base.roller.rasterization import NoRasterization
 from ..base import analysis
@@ -152,6 +152,20 @@ def get_index_map(index_map, l=16, r=16, is_5d=False):  # noqa: E741
     return get_index_map_3d(index_map, l, r)
 
 
+def check_weight_decode_info(weight_decode_info):
+    conditions = []
+    # check source format in ["int", "fp", "nf"]
+    conditions.append("source_format" in weight_decode_info)
+    conditions.append(
+        weight_decode_info["source_format"]["format"] in ["uint", "int", "fp", "nf", "fp_e4m3"])
+    # check source bits in [1, 2, 4, 8]
+    conditions.append(weight_decode_info["source_format"]["bits"] in [1, 2, 4, 8])
+    # check target format in ["float16", "int8"]
+    conditions.append("target_format" in weight_decode_info)
+    conditions.append(weight_decode_info["target_format"] in ["bfloat16", "float16", "int8"])
+    return all(conditions)
+
+
 class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
     """
     The schedule rule for float16 tensor core matmul computation.
@@ -211,19 +225,6 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         assert check_dequantize_info(dequantize_info)
 
         (weight_decode_info,) = list(dequantize_info.values())
-
-        def check_weight_decode_info(weight_decode_info):
-            conditions = []
-            # check source format in ["int", "fp", "nf"]
-            conditions.append("source_format" in weight_decode_info)
-            conditions.append(weight_decode_info["source_format"]["format"] in
-                              ["uint", "int", "fp", "nf", "fp_e4m3"])
-            # check source bits in [1, 2, 4, 8]
-            conditions.append(weight_decode_info["source_format"]["bits"] in [1, 2, 4, 8])
-            # check target format in ["float16", "int8"]
-            conditions.append("target_format" in weight_decode_info)
-            conditions.append(weight_decode_info["target_format"] in ["float16", "int8"])
-            return all(conditions)
 
         assert check_weight_decode_info(weight_decode_info), "Invalid Weight Decode Info"
 
@@ -727,19 +728,6 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
 
         (weight_decode_info,) = list(dequantize_info.values())
 
-        def check_weight_decode_info(weight_decode_info):
-            conditions = []
-            # check source format in ["int", "fp", "nf"]
-            conditions.append("source_format" in weight_decode_info)
-            conditions.append(weight_decode_info["source_format"]["format"] in
-                              ["uint", "int", "fp", "nf", "fp_e4m3"])
-            # check source bits in [1, 2, 4, 8]
-            conditions.append(weight_decode_info["source_format"]["bits"] in [1, 2, 4, 8])
-            # check target format in ["float16", "int8"]
-            conditions.append("target_format" in weight_decode_info)
-            conditions.append(weight_decode_info["target_format"] in ["float16", "int8"])
-            return all(conditions)
-
         assert check_weight_decode_info(weight_decode_info), "Invalid Weight Decode Info"
 
         # Start Schedule
@@ -901,6 +889,12 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         sch.bind(thread_idy, "threadIdx.y")
         sch.bind(thread_idz, "threadIdx.z")
 
+        # rewrite smooth layout of shared memory
+        # enable_store_rewrite is a hack as in some cases
+        # lower vectorization factor may failed to generate
+        # expected high performance code
+        enable_store_rewrite = not intrin_info.is_input_8bit()
+
         def smooth_layout_recover(block, scope, l=16, r=16, enable=True):  # noqa: E741
             if not enable:
                 return
@@ -923,7 +917,7 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
             *b_lr,
             enable=intrin_info.inter_transform_b,
         )
-        smooth_layout_recover(block_outer, ("write", 0), enable=True)
+        smooth_layout_recover(block_outer, ("write", 0), enable=enable_store_rewrite)
 
         def fetch_to_shared(block, idx, vec_len, can_swizzle=False, is_smooth=False):
             block_read = sch.cache_read(block, idx, shared_scope)
@@ -1079,7 +1073,8 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
                 preserve_unit_loops=True,
             )
             vec_len = get_coalesced_veclen(sch.get(accumulator_shared_to_global))
-            fused = sch.fuse(*sch.get_loops(accumulator_shared_to_global)[-5:])
+            fuse_iters = 5 if enable_store_rewrite else 3
+            fused = sch.fuse(*sch.get_loops(accumulator_shared_to_global)[-fuse_iters:])
             f0, f1, f2 = sch.split(fused, factors=[None, warp_size, vec_len])
             sch.bind(f1, "threadIdx.x")
             sch.vectorize(f2)
@@ -1108,7 +1103,7 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         sch.transform_layout(
             store,
             ("read", 0),
-            get_index_map(index_map_c, is_5d=True),
+            get_index_map(index_map_c, is_5d=enable_store_rewrite),
         )
 
         i, j = sch.get_loops(A_mat)[-2:]
@@ -1182,7 +1177,7 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         """
 
         weight_transform_kind = config.intrin_info.weight_transform_kind
-        if weight_transform_kind == TransformKind.LDMatrixTransform and config.block_reduction_depth is not None:
+        if weight_transform_kind == TransformKind.LDMatrixTransform:
             return self.sch_warp_memory_prefetch_with_config(func, config)
 
         is_cross_thread_reduce = (
@@ -1224,20 +1219,6 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         assert check_dequantize_info(dequantize_info)
 
         (weight_decode_info,) = list(dequantize_info.values())
-
-        def check_weight_decode_info(weight_decode_info):
-            conditions = []
-            # check source format in ["int", "fp", "nf"]
-            conditions.append("source_format" in weight_decode_info)
-            conditions.append(weight_decode_info["source_format"]["format"] in
-                              ["uint", "int", "fp", "nf", "fp_e4m3"])
-            # check source bits in [1, 2, 4, 8]
-            conditions.append(weight_decode_info["source_format"]["bits"] in [1, 2, 4, 8])
-            # check target format in ["float16", "int8"]
-            conditions.append("target_format" in weight_decode_info)
-            conditions.append(
-                weight_decode_info["target_format"] in ["bfloat16", "float16", "int8"])
-            return all(conditions)
 
         assert check_weight_decode_info(weight_decode_info), "Invalid B_decode_info"
 
@@ -1458,10 +1439,17 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         sch.bind(block_idy, "blockIdx.y")
         if reduce_k > 1:
             thread_idz = j2 = thread_idy = sch.fuse(thread_idy, thread_idz)
+            sch.bind(thread_idy, "threadIdx.y")
             sch.bind(kr, "threadIdx.z")
         else:
             sch.bind(thread_idy, "threadIdx.y")
             sch.bind(thread_idz, "threadIdx.z")
+
+        # rewrite smooth layout of shared memory
+        # enable_store_rewrite is a hack as in some cases
+        # lower vectorization factor may failed to generate
+        # expected high performance code
+        enable_store_rewrite = not intrin_info.is_input_8bit()
 
         def smooth_layout_recover(block, scope, l=16, r=16, enable=True):  # noqa: E741
             if not enable:
@@ -1485,7 +1473,7 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
             *b_lr,
             enable=intrin_info.inter_transform_b,
         )
-        smooth_layout_recover(block_outer, ("write", 0), enable=True)
+        smooth_layout_recover(block_outer, ("write", 0), enable=enable_store_rewrite)
 
         def fetch_to_shared(block, idx, vec_len, can_swizzle=False, is_smooth=False):
             block_read = sch.cache_read(block, idx, shared_scope)
@@ -1679,7 +1667,8 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
                 preserve_unit_loops=True,
             )
             vec_len = get_coalesced_veclen(sch.get(accumulator_shared_to_global))
-            fused = sch.fuse(*sch.get_loops(accumulator_shared_to_global)[-5:])
+            fuse_iters = 5 if enable_store_rewrite else 3
+            fused = sch.fuse(*sch.get_loops(accumulator_shared_to_global)[-fuse_iters:])
             f0, f1, f2 = sch.split(fused, factors=[None, warp_size, vec_len])
             sch.bind(f1, "threadIdx.x")
             sch.vectorize(f2)
@@ -1708,7 +1697,7 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         sch.transform_layout(
             store,
             ("read", 0),
-            get_index_map(index_map_c, is_5d=True),
+            get_index_map(index_map_c, is_5d=enable_store_rewrite),
         )
 
         i, j = sch.get_loops(A_mat)[-2:]
@@ -1819,19 +1808,6 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
 
         (weight_decode_info,) = list(dequantize_info.values())
 
-        def check_weight_decode_info(weight_decode_info):
-            conditions = []
-            # check source format in ["int", "fp", "nf"]
-            conditions.append("source_format" in weight_decode_info)
-            conditions.append(weight_decode_info["source_format"]["format"] in
-                              ["uint", "int", "fp", "nf", "fp_e4m3"])
-            # check source bits in [1, 2, 4, 8]
-            conditions.append(weight_decode_info["source_format"]["bits"] in [1, 2, 4, 8])
-            # check target format in ["float16", "int8"]
-            conditions.append("target_format" in weight_decode_info)
-            conditions.append(weight_decode_info["target_format"] in ["float16", "int8"])
-            return all(conditions)
-
         assert check_weight_decode_info(weight_decode_info), "Invalid B_decode_info"
 
         # Start Schedule
@@ -1864,8 +1840,7 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         block_col_warps = config.block[1] // warp_col_tiles
         stage = config.pipeline_stage
         use_async = config.use_async
-        assert (config.block_reduction_depth is not None), "block_reduction_depth is required"
-        reduce_k = config.block_reduction_depth
+        reduce_k = config.block_reduction_depth if config.block_reduction_depth is not None else 1
         chunk = config.rstep[0] // reduce_k
 
         micro_size_x, micro_size_y, micro_size_k = intrin_group["micro_kernel"]
@@ -2043,9 +2018,12 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         i0, i1, i2, i3 = sch.split(i, factors=i_factors)
         j0, j1, j2, j3 = sch.split(j, factors=j_factors)
         k0, k1 = sch.split(k, k_factors)
-        k0, kr = sch.split(k0, [None, reduce_k])
+        if reduce_k > 1:
+            k0, kr = sch.split(k0, [None, reduce_k])
 
-        sch.reorder(i0, j0, i1, j1, i2, j2, kr, k0, k1, i3, j3)
+            sch.reorder(i0, j0, i1, j1, i2, j2, kr, k0, k1, i3, j3)
+        else:
+            sch.reorder(i0, j0, i1, j1, i2, j2, k0, k1, i3, j3)
 
         block_idy = sch.fuse(i0, j0)
         block_idx = sch.fuse(i1, j1)
@@ -2055,12 +2033,19 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         sch.bind(batch, "blockIdx.z")
         sch.bind(block_idx, "blockIdx.x")
         sch.bind(block_idy, "blockIdx.y")
-        thread_idz = j2 = thread_idy = sch.fuse(thread_idy, thread_idz)
-        sch.bind(thread_idy, "threadIdx.y")
+        if reduce_k > 1:
+            thread_idz = j2 = thread_idy = sch.fuse(thread_idy, thread_idz)
+            sch.bind(thread_idy, "threadIdx.y")
+            sch.bind(kr, "threadIdx.z")
+        else:
+            sch.bind(thread_idy, "threadIdx.y")
+            sch.bind(thread_idz, "threadIdx.z")
 
-        # Put the thread binding after the shared memory prefetch
-        # Otherwise there's a axis missing bug behind tvm
-        sch.bind(kr, "threadIdx.z")
+        # rewrite smooth layout of shared memory
+        # enable_store_rewrite is a hack as in some cases
+        # lower vectorization factor may failed to generate
+        # expected high performance code
+        enable_store_rewrite = not intrin_info.is_input_8bit()
 
         def smooth_layout_recover(block, scope, l=16, r=16, enable=True):  # noqa: E741
             if not enable:
@@ -2084,7 +2069,7 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
             *b_lr,
             enable=intrin_info.inter_transform_b,
         )
-        smooth_layout_recover(block_outer, ("write", 0), enable=True)
+        smooth_layout_recover(block_outer, ("write", 0), enable=enable_store_rewrite)
 
         def fetch_to_shared(block, idx, vec_len, can_swizzle=False, is_smooth=False):
             block_read = sch.cache_read(block, idx, shared_scope)
@@ -2092,13 +2077,20 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
             ndim = len(sch.get(block_read).iter_vars)
             fused = sch.fuse(*sch.get_loops(block_read)[-ndim:])
 
-            f_0, f_r, f_1, f_2, f_3, f_4 = sch.split(
-                fused, factors=[None, reduce_k, num_ty, num_tz, warp_size, vec_len])
+            if reduce_k > 1:
+                f_r, f_0, f_1, f_2, f_3, f_4 = sch.split(
+                    fused, factors=[reduce_k, num_ty, num_tz, None, warp_size, vec_len])
+                sch.bind(f_3, "threadIdx.x")
+                f_0 = f_1 = sch.fuse(f_0, f_1)
+                sch.bind(f_0, "threadIdx.y")
+                sch.bind(f_r, "threadIdx.z")
+            else:
+                f_0, f_1, f_2, f_3, f_4 = sch.split(
+                    fused, factors=[num_ty, num_tz, None, warp_size, vec_len])
+                sch.bind(f_3, "threadIdx.x")
+                sch.bind(f_1, "threadIdx.z")
+                sch.bind(f_0, "threadIdx.y")
 
-            sch.bind(f_3, "threadIdx.x")
-            f_1 = f_2 = sch.fuse(f_1, f_2)
-            sch.bind(f_1, "threadIdx.y")
-            sch.bind(f_r, "threadIdx.z")
             sch.vectorize(f_4)
             sch.unroll(f_0)
             sch.annotate(f_0, "pragma_unroll_explicit", False)
@@ -2123,7 +2115,8 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
 
         # Put the thread binding after the shared memory prefetch
         # Otherwise there's a axis missing bug behind tvm
-        sch.bind(kr, "threadIdx.z")
+        if reduce_k > 1:
+            sch.bind(kr, "threadIdx.z")
         # create read cache to load matrix from shared memory to wmma fragments
         A_mat = sch.cache_read(block_outer, 0, "warp")
         sch.compute_at(A_mat, k1, preserve_unit_loops=True)
@@ -2165,18 +2158,24 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
             ndim = len(sch.get(B_shared).iter_vars)
             _ = sch.fuse(*sch.get_loops(B_shared)[-ndim:])
 
-            _bind_thread_based_with_block_reduce_on_config(
-                sch,
-                B_shared,
-                num_ty,
-                num_tz,
-                warp_size,
-                reduce_k,
-            )
+            if reduce_k > 1:
+                _bind_thread_based_with_block_reduce_on_config(
+                    sch,
+                    B_shared,
+                    num_ty,
+                    num_tz,
+                    warp_size,
+                    reduce_k,
+                )
+            else:
+                _bind_thread_based_on_config(sch, B_shared, num_ty, num_tz, warp_size)
             return B_dequantized_mat
 
         B_dequantized_mat = warp_memory_dequantize()
-
+        # Put the thread binding after the shared memory prefetch
+        # Otherwise there's a axis missing bug behind tvm
+        if reduce_k > 1:
+            sch.bind(kr, "threadIdx.z")
         # create write cache to store matrix from wmma fragments to shared memory and global memory
         if cache_write_required:
             accumulator_shared_to_global = sch.cache_write(block_outer, 0, shared_scope)
@@ -2197,9 +2196,14 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
                 sch.get_loops(store)[-6],
                 preserve_unit_loops=True,
             )
-            vec_len = get_coalesced_veclen(sch.get(accumulator_shared_to_global))
-            fused = sch.fuse(*sch.get_loops(accumulator_shared_to_global)[-5:])
-            f0, f1, f2 = sch.split(fused, factors=[None, warp_size, vec_len])
+            fuse_iters = 5 if enable_store_rewrite else 3
+            fused = sch.fuse(*sch.get_loops(accumulator_shared_to_global)[-fuse_iters:])
+            f0, f1, f2 = sch.split(
+                fused,
+                factors=[
+                    None, warp_size,
+                    get_coalesced_veclen(sch.get(accumulator_shared_to_global))
+                ])
             sch.bind(f1, "threadIdx.x")
             sch.vectorize(f2)
             sch.unroll(f0)
@@ -2227,7 +2231,7 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         sch.transform_layout(
             store,
             ("read", 0),
-            get_index_map(index_map_c, is_5d=True),
+            get_index_map(index_map_c, is_5d=enable_store_rewrite),
         )
 
         i, j = sch.get_loops(A_mat)[-2:]
@@ -2243,6 +2247,7 @@ class MatmulTensorizationMMAWithDequantizeInfo(GPUScheduleRule):
         j0, j1 = sch.split(j, factors=[None, b_lr[1]])
         sch.reorder(i0, j0, i1, j1)
         _ = sch.blockize(i1)
+        vec_len = get_coalesced_veclen(sch.get(B_dequantized_mat))
         sch.transform_block_layout(
             B_dequantized_mat, lambda i, j: ((i * b_lr[1] + j) // vec_len,
                                              (i * b_lr[1] + j) % vec_len))

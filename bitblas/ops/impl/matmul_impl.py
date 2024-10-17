@@ -4,7 +4,7 @@
 from bitblas import tvm
 from tvm import te
 from bitblas.gpu.matmul_analysis import get_propagate_map
-from bitblas.ops.operator import TransformKind
+from bitblas.ops.common import TransformKind
 
 
 def matmul_nn(
@@ -168,6 +168,8 @@ def matmul_nt_propagate_b(
     with_bias=False,
     transform_kind: TransformKind = TransformKind.IntraWarpTransform,
 ):
+    if isinstance(transform_kind, int):
+        transform_kind = TransformKind(transform_kind)
     if not isinstance(M, int):
         M = tvm.te.var("m")
     l = r = 16  # noqa: E741

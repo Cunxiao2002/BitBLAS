@@ -4,13 +4,15 @@ from bitblas import tvm
 from tvm.target import Target
 import operator
 from functools import reduce
-from enum import IntEnum
 from bitblas.base.arch.cuda import CUDA
 from bitblas.base.roller.hint import Hint
 from typing import Any, Literal, Optional, Tuple, Union
-from ..operator import OperatorConfig, Operator, TransformKind, OPExecutorCPU, BaseKernelNameGenerator
+from ..operator import OperatorConfig, Operator, OPExecutorCPU, BaseKernelNameGenerator
+from ..common import TransformKind, OptimizeStrategy
 from .tirscript.matmul_dequantize_impl import select_implementation as weight_dequantize_implementation
 from .tirscript.matmul_impl import select_implementation as consistent_implementation
+from .tilelang.dense import select_scheduler as consistent_scheduler
+from .tilelang.dequantize import select_scheduler as weight_dequantize_scheduler
 from ...base.utils import tensor_replace_dp4a, tensor_remove_make_int4, tensor_remove_make_int2
 from bitblas.utils.target_detector import auto_detect_nvidia_target
 from dataclasses import dataclass
@@ -48,16 +50,11 @@ CONFIG_INFO_MESSAGE_STRATEGY = """Optimization Strategy Notice: You are currentl
 """
 
 
-class OptimizeStrategy(IntEnum):
-    SingleBatchDecodeOnly = 0
-    ContigousBatching = 1
-
-
 @dataclass(frozen=True)
 class MatmulConfig(OperatorConfig):
     M: Union[int, Tuple[int]] = None
-    N: int = None
-    K: int = None
+    N: Optional[int] = None
+    K: Optional[int] = None
     A_dtype: str = "float16"
     # is a wrapper for source_format and bit
     W_dtype: str = A_dtype  # W_dtype is the same as A_dtype by default
@@ -97,7 +94,7 @@ class MatmulConfig(OperatorConfig):
 
     def __legalize_propagate(self, propagate):
         if isinstance(propagate, bool):
-            return (TransformKind.IntraWarpTransform if propagate else TransformKind.NonTransform)
+            return (TransformKind.LDMatrixTransform if propagate else TransformKind.NonTransform)
         elif isinstance(propagate, int):
             return TransformKind(propagate)
 
@@ -145,6 +142,9 @@ class MatmulConfig(OperatorConfig):
         if self.A_dtype in ["e4m3_float8", "e5m2_float8", "bfloat16"]:
             object.__setattr__(self, "propagate_a", TransformKind.NonTransform)
             object.__setattr__(self, "propagate_b", TransformKind.NonTransform)
+
+        # TODO(lei): propagation can only be enabled on SM80+ Devices and MI200+
+        # We should add a check here to disable the propagation if the device is not supported.
 
     def __initialize_zeros_mode(self, zeros_mode: Optional[str]):
         if zeros_mode is None:
@@ -236,7 +236,7 @@ class MatmulKernelNameGenerator(BaseKernelNameGenerator):
         if hint is None:
             return "default"
         else:
-            if hint.use_tc:
+            if hasattr(hint, "use_tc") and hint.use_tc:
                 hint_prefix = "tc"
                 BM, BN = hint.block
                 WM, WN = hint.warp
@@ -300,6 +300,7 @@ class MatmulKernelNameGenerator(BaseKernelNameGenerator):
         #     kernel_name += f"_pb{config.propagate_b.value}"
 
         kernel_name = "_".join([kernel_name, self.serialize_hint(hint)])
+        assert self.is_valid(kernel_name), "Kernel name invalid"
         return kernel_name
 
     def is_valid_config(self, config: OperatorConfig) -> bool:
@@ -357,8 +358,7 @@ class Matmul(Operator):
 
         self.source_format = source_format
         self.bit = bit
-        self.backend = backend
-        super().__init__(name, config, target)
+        super().__init__(name, config, target, backend)
 
         if source_format == "int" and self.with_zeros:
             logger.warning(
@@ -381,7 +381,7 @@ class Matmul(Operator):
 
         if isinstance(self.M, Tuple):
             self.dynamic_range = {"m": self.M}
-            self.prim_func_mod["main"] = self.prim_func_mod["main"].with_attrs(
+            self.ir_module["main"] = self.ir_module["main"].with_attrs(
                 {"opt_shapes": self.dynamic_range})
         else:
             self.dynamic_range = None
@@ -557,6 +557,42 @@ class Matmul(Operator):
             )
         else:
             return weight_dequantize_implementation(
+                M=self.M,
+                N=self.N,
+                K=self.K,
+                in_dtype=self.A_dtype,
+                out_dtype=self.out_dtype,
+                accum_dtype=self.accum_dtype,
+                bit=self.bit,
+                storage_dtype=self.storage_dtype,
+                source_format=self.source_format,
+                with_scaling=self.with_scaling,
+                with_zeros=self.with_zeros,
+                group_size=self.group_size,
+                fast_decoding=self.fast_decoding,
+                with_bias=self.with_bias,
+                layout=self.layout,
+                zeros_mode=self.zeros_mode,
+                propagate_a=self.propagate_a,
+                propagate_b=self.propagate_b,
+            )
+
+    def _select_scheduler(self):
+        if is_native_compute(self.A_dtype, self.W_dtype):
+            return consistent_scheduler(
+                M=self.M,
+                N=self.N,
+                K=self.K,
+                in_dtype=self.A_dtype,
+                out_dtype=self.out_dtype,
+                accum_dtype=self.accum_dtype,
+                with_bias=self.with_bias,
+                layout=self.layout,
+                propagate_a=self.propagate_a,
+                propagate_b=self.propagate_b,
+            )
+        else:
+            return weight_dequantize_scheduler(
                 M=self.M,
                 N=self.N,
                 K=self.K,

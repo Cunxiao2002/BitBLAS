@@ -1,5 +1,6 @@
 ### Using BitBLAS from DSL
 ```python
+from bitblas.gpu.matmul_analysis import get_tensorized_func_and_tags
 from bitblas.base.roller.policy import TensorCorePolicy, DefaultPolicy
 from bitblas.base.arch import CUDA
 from bitblas.base.utils import apply_and_build
@@ -136,7 +137,7 @@ class MatmulNT:
 
 from bitblas import fast_tune_with_dynamic_range
 # Tune with dynamic symbolic
-optimized_mod = fast_tune_with_dynamic_range(
+scheduled_ir_module = fast_tune_with_dynamic_range(
     func, target, topk=topk, parallel_build=True, 
     dynamic_range={
         "M": [1, 1024]

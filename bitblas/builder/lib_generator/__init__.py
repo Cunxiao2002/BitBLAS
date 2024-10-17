@@ -4,6 +4,8 @@ from typing import Optional
 from bitblas.base.arch import TileDevice
 import ctypes
 import os
+import os.path as osp
+import sys
 import tempfile
 import subprocess
 import logging
@@ -26,7 +28,7 @@ class LibraryGenerator(object):
     def load_lib(self):
         return ctypes.CDLL(self.libpath)
 
-    def compile_lib(self, timeout: float = None):
+    def compile_lib(self, timeout: float = None, with_tl: bool = False):
         arch = self.arch
         src = tempfile.NamedTemporaryFile(mode="w", suffix=".cu", delete=False)
         compute_version = arch.compute_capability
@@ -45,9 +47,35 @@ class LibraryGenerator(object):
             "-lcuda",
             "-gencode",
             f"arch=compute_{compute_version},code=sm_{compute_version}",
-            "-o",
-            libpath,
         ]
+
+        if with_tl:
+            install_tvm_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "../..", "3rdparty", "tvm")
+            develop_tvm_path = os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), "../../..", "3rdparty", "tvm")
+
+            tvm_root = next((path for path in [install_tvm_path, develop_tvm_path]
+                             if os.path.exists(path) and path not in sys.path), None)
+
+            if "TL_TEMPLATE_PATH " in os.environ:
+                tl_template_path = os.environ["TL_TEMPLATE_PATH"]
+            else:
+                tl_template_path = osp.abspath(osp.join(tvm_root, "src/tl"))
+
+            tl_template_path = osp.abspath(osp.join(tvm_root, "src/tl"))
+            if "TL_CUTLASS_PATH" in os.environ:
+                cutlass_path = os.environ["TL_CUTLASS_PATH"]
+            else:
+                cutlass_path = osp.abspath(osp.join(tvm_root, "3rdparty/cutlass/include"))
+
+            command += [
+                "-I" + tl_template_path,
+                "-I" + cutlass_path,
+            ]
+            command += ["-diag-suppress=20013"]
+        command += ["-o", libpath]
+
         src.write(self.lib_code)
         src.flush()
         try:
