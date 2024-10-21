@@ -32,3 +32,4 @@ policy = DefaultPolicy(func=func, arch=arch)
 tags = None
 
 configs = policy.emit_config(topk=20)
+print(configs)
