@@ -62,65 +62,17 @@ def write_mod(mod, path, fname):
     cu_fname = fname + ".cu"
     write_code(mod.astext(show_meta_data=False), path, cu_fname)
 
+from tvm.relay.frontend.onnx import from_onnx
+import onnx
 
-def get_network(name, batch_size, layout="NHWC", dtype="float32"):
-    """Get the symbol definition and random weight of a network"""
+model_path = "/root/BitBLAS/examples/NeRF-b128/model.onnx"
+onnx_model = onnx.load(model_path)
+relay_mod, params = from_onnx(onnx_model)
 
-    # auto-scheduler prefers NHWC layout
-    if layout == "NHWC":
-        image_shape = (224, 224, 3)
-    elif layout == "NCHW":
-        image_shape = (3, 224, 224)
-    else:
-        raise ValueError("Invalid layout: " + layout)
-
-    input_shape = (batch_size,) + image_shape
-    output_shape = (batch_size, 1000)
-
-    if name.startswith("resnet-") or name.startswith("resnet3d-"):
-        n_layer = int(name.split("-")[1])
-        mod, params = relay.testing.resnet.get_workload(
-            num_layers=n_layer,
-            batch_size=batch_size,
-            layout=layout,
-            dtype=dtype,
-            image_shape=image_shape,
-        )
-    elif name == "mobilenet":
-        mod, params = relay.testing.mobilenet.get_workload(
-            batch_size=batch_size, layout=layout, dtype=dtype, image_shape=image_shape)
-    elif name == "squeezenet_v1.1":
-        assert layout == "NCHW", "squeezenet_v1.1 only supports NCHW layout"
-        mod, params = relay.testing.squeezenet.get_workload(
-            version="1.1",
-            batch_size=batch_size,
-            dtype=dtype,
-            image_shape=image_shape,
-        )
-    elif name == "inception_v3":
-        input_shape = (batch_size, 3, 299, 299) if layout == "NCHW" else (batch_size, 299, 299, 3)
-        mod, params = relay.testing.inception_v3.get_workload(batch_size=batch_size, dtype=dtype)
-    elif name == "mlp":
-        mod, params = relay.testing.mlp.get_workload(
-            batch_size=batch_size, image_shape=image_shape, dtype=dtype)
-
-    return mod, params, input_shape, output_shape
-
-
-# Define the neural network and compilation target.
-network = "mlp"
-# network = "resnet-18"
-batch_size = 128
-layout = "NHWC"
-# Path to cross compiler
-target = tvm.target.Target("nvidia/nvidia-a100")
+target = tvm.target.Target("cuda")
 dtype = "float32"
 
-relay_mod, params, input_shape, output_shape = get_network(network, batch_size, layout, dtype=dtype)
-
-
-def apply_opt_before_tuning(relay_mod: IRModule, params: Dict[str, runtime.NDArray],
-                            target: Target):
+def apply_opt_before_tuning(relay_mod: IRModule, params: Dict[str, runtime.NDArray], target: Target):
     with transform.PassContext(opt_level=3):
         main_func = relay_mod["main"]
         bind_main_func = relay.build_module.bind_params_by_name(main_func, params)
@@ -157,61 +109,12 @@ def apply_opt_before_tuning(relay_mod: IRModule, params: Dict[str, runtime.NDArr
         write_mod(relax_mod, log_path, "FuseTIR")
     return relax_mod
 
-
 relax_mod = apply_opt_before_tuning(relay_mod, params, target)
+
+#print(relax_mod)
+
 start_tune_time = time.time()
-relax_mod = ApplyFastTuning(topk=1, target=target, parallel_build=False)(relax_mod)
+relax_mod = ApplyFastTuning(topk=20, target=target, parallel_build=False)(relax_mod)
 end_tune_time = time.time()
 
-write_mod(relax_mod, log_path, "ApplyFastTuning")
-print("Time cost of Fast Dlight tuniing: {:.3f} s".format((end_tune_time - start_tune_time)))
-
-with target:
-    schedule_rules = [
-        bitblas.gpu.Matmul(),
-        bitblas.gpu.GEMV(),
-        bitblas.gpu.Reduction(),
-        bitblas.gpu.GeneralReduction(),
-        bitblas.gpu.Fallback(),
-    ]
-    for rule in schedule_rules:
-        relax_mod = ApplyDefaultSchedule(rule)(relax_mod)
-
-write_mod(relax_mod, log_path, "ApplyFastTuning")
-
-relax_mod = relax.transform.RunCodegen()(relax_mod)
-
-write_mod(relax_mod, log_path, "run_codegen")
-
-#relax_mod = tvm.tir.transform.MakePackedAPI()(relax_mod)
-write_mod(relax_mod, log_path, "make_packed_api")
-
-ex = relax.build(relax_mod, target)
-write_code(ex.mod.imported_modules[0].imported_modules[0].get_source(), log_path, "tmp.cu")
-
-device = tvm.cuda(0)
-vm = relax.VirtualMachine(ex, device)
-
-# init parameters
-params = nn.init_params(relax_mod)
-
-input_args = []
-
-input_args.append(tvm.nd.array(np.random.uniform(-1, 1, size=input_shape).astype(dtype), device))
-
-res = vm["main"](*input_args)
-
-print(res)
-
-device.sync()
-
-start = time.time()
-
-for _ in range(10):
-    vm["main"](*input_args)
-
-device.sync()
-
-end = time.time()
-
-print("Time cost is: ", (end - start) * 100, "ms")
+write_code(relax_mod, log_path, "apply_opt_before_tuning")
