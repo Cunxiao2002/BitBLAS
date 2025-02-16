@@ -9,22 +9,25 @@ from bitblas.base.arch import (
     TileDevice,
     is_ampere_arch,
     is_volta_arch,
+    is_ada_arch,
+    is_hopper_arch,
     is_tensorcore_supported_precision,
 )
+from tilelang.intrinsics.utils import get_mma_micro_size
 from dataclasses import dataclass
 from bitblas.tl.base_hint import BaseTLHint
 
 from .base import MatmulDequantizeBaseParams
 from .gemv_dequantize_simt import GemvDequantizeSIMTScheduler
 from .matmul_dequantize_simt import MatmulDequantizeSIMTScheduler
-from .matmul_dequantize_tensorcore import MatmulDequantizeBlockScheduler
-from .matmul_dequantize_tensorcore_finegrained import (
-    MatmulDequantizeFineGrainedScheduler,
-    MatmulINT4DequantizeFineGrainedScheduler,
+from .matmul_dequantize_tile import MatmulDequantizeTileLibraryScheduler
+from .matmul_dequantize_mma import (
+    MatmulDequantizeMMAScheduler,
+    MatmulINT4DequantizeMMAScheduler,
 )
-from .matmul_dequantize_tensorcore_weight_transform import (
-    MatmulDequantizeWeightPropagationScheduler,
-    MatmulINT4DequantizeWeightPropagationScheduler,
+from .matmul_dequantize_mma_weight_transform import (
+    MatmulDequantizeMMAWeightPropagationScheduler,
+    MatmulINT4DequantizeMMAWeightPropagationScheduler,
 )
 
 import logging
@@ -38,26 +41,23 @@ class MatmulDequantizeScheduler(MatmulDequantizeBaseParams):
     # Allows for more detailed configuration.
     gemv_dequantize_simt_scheduler: Optional[GemvDequantizeSIMTScheduler] = None
     matmul_dequantize_simt_scheduler: Optional[MatmulDequantizeSIMTScheduler] = None
-    matmul_dequantize_block_scheduler: Optional[MatmulDequantizeBlockScheduler] = None
-    matmul_dequantize_fine_grained_scheduler: Optional[MatmulDequantizeFineGrainedScheduler] = None
-    matmul_dequantize_weight_propagation_scheduler: Optional[
-        MatmulDequantizeWeightPropagationScheduler] = None
-    matmul_int4_dequantize_fine_grain_scheduler: Optional[
-        MatmulINT4DequantizeFineGrainedScheduler] = None
-    matmul_int4_dequantize_weight_propagation_scheduler: Optional[
-        MatmulINT4DequantizeWeightPropagationScheduler] = None
+    matmul_dequantize_block_scheduler: Optional[MatmulDequantizeTileLibraryScheduler] = None
+    matmul_dequantize_mma_scheduler: Optional[MatmulDequantizeMMAScheduler] = None
+    matmul_dequantize_mma_weight_propagation_scheduler: Optional[
+        MatmulDequantizeMMAWeightPropagationScheduler] = None
+    matmul_int4_dequantize_mma_scheduler: Optional[MatmulINT4DequantizeMMAScheduler] = None
+    matmul_int4_dequantize_mma_weight_propagation_scheduler: Optional[
+        MatmulINT4DequantizeMMAWeightPropagationScheduler] = None
 
     def __init__(self, **kwargs):
         self.gemv_dequantize_simt_scheduler = GemvDequantizeSIMTScheduler(**kwargs)
         self.matmul_dequantize_simt_scheduler = MatmulDequantizeSIMTScheduler(**kwargs)
-        self.matmul_dequantize_block_scheduler = MatmulDequantizeBlockScheduler(**kwargs)
-        self.matmul_dequantize_fine_grained_scheduler = MatmulDequantizeFineGrainedScheduler(
+        self.matmul_dequantize_block_scheduler = MatmulDequantizeTileLibraryScheduler(**kwargs)
+        self.matmul_dequantize_mma_scheduler = MatmulDequantizeMMAScheduler(**kwargs)
+        self.matmul_dequantize_mma_weight_propagation_scheduler = MatmulDequantizeMMAWeightPropagationScheduler(
             **kwargs)
-        self.matmul_dequantize_weight_propagation_scheduler = MatmulDequantizeWeightPropagationScheduler(
-            **kwargs)
-        self.matmul_int4_dequantize_fine_grain_scheduler = MatmulINT4DequantizeFineGrainedScheduler(
-            **kwargs)
-        self.matmul_int4_dequantize_weight_propagation_scheduler = MatmulINT4DequantizeWeightPropagationScheduler(
+        self.matmul_int4_dequantize_mma_scheduler = MatmulINT4DequantizeMMAScheduler(**kwargs)
+        self.matmul_int4_dequantize_mma_weight_propagation_scheduler = MatmulINT4DequantizeMMAWeightPropagationScheduler(
             **kwargs)
 
         super().__init__(**kwargs)
@@ -78,10 +78,10 @@ class MatmulDequantizeScheduler(MatmulDequantizeBaseParams):
             if is_tensorcore_supported_precision(in_dtype, accum_dtype, arch):
                 if weight_transform_kind != TransformKind.NonTransform:
                     # INT4 Can be fused into general dequantize
-                    return (self.matmul_int4_dequantize_weight_propagation_scheduler if in_dtype
-                            == "int4" else self.matmul_dequantize_weight_propagation_scheduler)
+                    return (self.matmul_int4_dequantize_mma_weight_propagation_scheduler if in_dtype
+                            == "int4" else self.matmul_dequantize_mma_weight_propagation_scheduler)
                 else:
-                    return self.matmul_int4_dequantize_fine_grain_scheduler if in_dtype == "int4" else self.matmul_dequantize_fine_grained_scheduler
+                    return self.matmul_int4_dequantize_mma_scheduler if in_dtype == "int4" else self.matmul_dequantize_mma_scheduler
             else:
                 if in_dtype == "int4":
                     raise ValueError("INT4 is not supported for non-TensorCore architectures")
@@ -90,8 +90,8 @@ class MatmulDequantizeScheduler(MatmulDequantizeBaseParams):
                         "Weight propagation is not supported for non-TensorCore architectures")
                 return self.matmul_dequantize_simt_scheduler
         else:
-            minimal_tensorcore_threshold: List[int, int, int] = ([8, 16, 32] if accum_dtype
-                                                                 == "int32" else [8, 16, 16])
+            _, _, micro_size_k = get_mma_micro_size(in_dtype)
+            minimal_tensorcore_threshold: List[int, int, int] = [8, 16, micro_size_k]
             if (minimal_tensorcore_threshold[0] > M or minimal_tensorcore_threshold[1] > N or
                     minimal_tensorcore_threshold[2] > K):
                 if in_dtype == "int4":
@@ -103,10 +103,10 @@ class MatmulDequantizeScheduler(MatmulDequantizeBaseParams):
             elif is_tensorcore_supported_precision(in_dtype, accum_dtype, arch):
                 if self.weight_transform_kind != TransformKind.NonTransform:
                     return (
-                        self.matmul_int4_dequantize_weight_propagation_scheduler
-                    ) if in_dtype == "int4" else self.matmul_dequantize_weight_propagation_scheduler
+                        self.matmul_int4_dequantize_mma_weight_propagation_scheduler
+                    ) if in_dtype == "int4" else self.matmul_dequantize_mma_weight_propagation_scheduler
                 else:
-                    return self.matmul_int4_dequantize_fine_grain_scheduler if in_dtype == "int4" else self.matmul_dequantize_fine_grained_scheduler
+                    return self.matmul_int4_dequantize_mma_scheduler if in_dtype == "int4" else self.matmul_dequantize_mma_scheduler
             else:
                 return self.matmul_dequantize_simt_scheduler
 
@@ -144,7 +144,10 @@ class MatmulDequantizeScheduler(MatmulDequantizeBaseParams):
                 return self.matmul_dequantize_simt_scheduler
 
     def dispatch_scheduler(self, arch: TileDevice) -> BaseScheduler:
-        if is_ampere_arch(arch):
+        if is_hopper_arch(arch):
+            logger.warning("Hopper architecture is not supported for dequantize")
+            return self.dispatch_ampere_scheduler(arch)
+        elif is_ampere_arch(arch) or is_ada_arch(arch):
             return self.dispatch_ampere_scheduler(arch)
         elif is_volta_arch(arch):
             return self.dispatch_volta_scheduler(arch)
@@ -153,10 +156,21 @@ class MatmulDequantizeScheduler(MatmulDequantizeBaseParams):
 
     def detect_scheduler_from_hint(self, hint: BaseTLHint) -> BaseScheduler:
         for scheduler in [
+                self.gemv_dequantize_simt_scheduler,
+                self.matmul_dequantize_simt_scheduler,
                 self.matmul_dequantize_block_scheduler,
+                self.matmul_dequantize_mma_scheduler,
+                self.matmul_dequantize_mma_weight_propagation_scheduler,
+                self.matmul_int4_dequantize_mma_scheduler,
+                self.matmul_int4_dequantize_mma_weight_propagation_scheduler,
         ]:
-            if isinstance(hint, scheduler.TLHint):
-                return scheduler
+            try:
+                scheduler_hint_type = scheduler.get_hint_type()
+                if scheduler_hint_type == hint.hint_type:
+                    return scheduler
+            except NotImplementedError as e:
+                raise ValueError(f"get_hint_type() is not implemented for {type(scheduler)}") from e
+
         raise ValueError(f"Unsupported hint type: {type(hint)}")
 
     def with_default_config(self, arch: Optional[TileDevice] = None) -> PrimFunc:
@@ -215,10 +229,10 @@ class MatmulDequantizeScheduler(MatmulDequantizeBaseParams):
                 self.gemv_dequantize_simt_scheduler,
                 self.matmul_dequantize_simt_scheduler,
                 self.matmul_dequantize_block_scheduler,
-                self.matmul_dequantize_fine_grained_scheduler,
-                self.matmul_dequantize_weight_propagation_scheduler,
-                self.matmul_int4_dequantize_fine_grain_scheduler,
-                self.matmul_int4_dequantize_weight_propagation_scheduler,
+                self.matmul_dequantize_mma_scheduler,
+                self.matmul_dequantize_mma_weight_propagation_scheduler,
+                self.matmul_int4_dequantize_mma_scheduler,
+                self.matmul_int4_dequantize_mma_weight_propagation_scheduler,
         ]:
             scheduler.set_dynamic_range(dynamic_range)
         return self
@@ -229,10 +243,10 @@ class MatmulDequantizeScheduler(MatmulDequantizeBaseParams):
                 self.gemv_dequantize_simt_scheduler,
                 self.matmul_dequantize_simt_scheduler,
                 self.matmul_dequantize_block_scheduler,
-                self.matmul_dequantize_fine_grained_scheduler,
-                self.matmul_dequantize_weight_propagation_scheduler,
-                self.matmul_int4_dequantize_fine_grain_scheduler,
-                self.matmul_int4_dequantize_weight_propagation_scheduler,
+                self.matmul_dequantize_mma_scheduler,
+                self.matmul_dequantize_mma_weight_propagation_scheduler,
+                self.matmul_int4_dequantize_mma_scheduler,
+                self.matmul_int4_dequantize_mma_weight_propagation_scheduler,
         ]:
             scheduler.with_arch(arch)
         return self
@@ -241,6 +255,16 @@ class MatmulDequantizeScheduler(MatmulDequantizeBaseParams):
     def is_dynamic(self) -> bool:
         M, N, K = self.M, self.N, self.K
         return ((not isinstance(M, int)) or (not isinstance(N, int)) or (not isinstance(K, int)))
+
+    def __post_init__(self):
+        # Validate the matrix transpose settings
+        assert (self.trans_A is False), "Currently only support Matrix A not transposed"
+        assert (self.trans_B is True), "Currently only support Matrix B transposed"
+
+        # Legalize group_size
+        if self.with_scaling and self.group_size == -1:
+            object.__setattr__(self, "group_size", self.K)
+        return
 
 
 __all__ = ["MatmulDequantizeScheduler"]

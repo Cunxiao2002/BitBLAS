@@ -2,40 +2,33 @@
 # Licensed under the MIT License.
 from bitblas import tvm as tvm
 from tvm import DataType
-import tvm.tl.language as T
+from bitblas import tilelang as tilelang
+import tilelang.language as T
 from typing import Optional, List
-from bitblas.tl.utils import (
-    get_mma_micro_size,  # noqa: F401
-    make_mma_swizzle_layout as make_swizzle_layout,  # noqa: F401
-    index_to_coordinates,  # noqa: F401
+from tilelang.intrinsics.utils import (
+    get_mma_micro_size,
+    make_mma_swizzle_layout as make_swizzle_layout,
+    index_to_coordinates,
 )
 from bitblas.ops.general_matmul.tirscript import (
     matmul_dequantize_select_implementation,)
 from bitblas.tl.mma_macro_generator import (TensorCoreIntrinEmitter, INT4TensorCoreIntrinEmitter)
-from bitblas.base.arch import TileDevice
+from bitblas.base.arch import TileDevice, is_cuda_arch
 from bitblas.base.roller.hint import Hint
 from bitblas.base.roller.rasterization import NoRasterization
 from bitblas.base.utils import get_roller_hints_from_func
 from dataclasses import dataclass
-from bitblas.ops.general_matmul.tilelang.dequantize.matmul_dequantize_tensorcore import (
+from bitblas.ops.general_matmul.tilelang.dequantize.matmul_dequantize_tile import (
     MatmulDequantizeBaseScheduler,  # noqa: F401
 )
 from bitblas.tl.base_hint import BaseTLHint
-from bitblas.quantization import (
-    _tir_packed_int_to_int_convert,
-    _tir_packed_to_signed_convert,
-    _tir_packed_to_unsigned_convert,
-    _tir_packed_to_fp4_to_f16,
-    _tir_u8_to_f8_e4m3_to_f16,
-    _tir_packed_to_unsigned_convert_with_zeros,
-)
 
 # GPU warp configuration for NVIDIA GPUs
 warp_size = 32
 
 
 @dataclass
-class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
+class MatmulDequantizeMMAScheduler(MatmulDequantizeBaseScheduler):
 
     # Tensor Core Warp Configuration
     block_row_warps: int = 2
@@ -45,10 +38,13 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
     chunk: int = 32  # Usually determines the K-dimension split size
 
     # Other Optimization Parameters
-    num_stages: int = 2
+    num_stages: int = 0
     enable_rasterization: bool = False  # Enhance L2 Locality
+    split_k_factor: int = 1  # Split-K factor for SM waste optimization
 
     class TLHint(BaseTLHint):
+
+        hint_type: str = "MatmulDequantizeMMAScheduler"
 
         def __init__(self):
             super().__init__()
@@ -82,6 +78,7 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
             tl_hint.chunk = chunk
             tl_hint.num_stages = num_stages
             tl_hint.enable_rasterization = enable_rasterization
+            tl_hint.split_k_factor = hint.split_k_factor
 
             return tl_hint
 
@@ -94,6 +91,7 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
                 "chunk": self.chunk,
                 "num_stages": self.num_stages,
                 "enable_rasterization": self.enable_rasterization,
+                "split_k_factor": self.split_k_factor,
             }
 
         def __repr__(self):
@@ -105,13 +103,73 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
                     f"block_K={self.chunk},"
                     f"threads={self.block_row_warps * self.block_col_warps * warp_size},"
                     f"num_stages={self.num_stages},"
-                    f"enable_rasterization={self.enable_rasterization}"
+                    f"enable_rasterization={self.enable_rasterization},"
+                    f"split_k_factor={self.split_k_factor}"
                     "}")
+
+    def get_hint_type(self) -> str:
+        return self.TLHint.hint_type
 
     def serialize_hints_to_configs(self, hints: List[Hint]):
         configs = []
         for hint in hints:
+            # Extract static shape dimensions for matrix multiplication
+            M, N, K = self.M, self.N, self.K
+
+            # Determine if the shapes are statically defined (not dynamic)
+            is_static_shape = isinstance(M, int) and isinstance(N, int) and isinstance(K, int)
+
+            # Check if the architecture is CUDA-based
+            arch_is_cuda = is_cuda_arch(self.arch)
+
+            # If the architecture is CUDA and we have a static shape, proceed with optimization
+            if arch_is_cuda and is_static_shape:
+                sm_waste_threshold = 5e-2  # Allow at most 5% SM waste
+                num_sms = self.arch.compute_max_core  # Get the maximum number of streaming multiprocessors
+
+                # Compute block sizes based on the configuration
+                block_M = hint.block[0]  # Block size in the M dimension
+                block_N = hint.block[1]  # Block size in the N dimension
+                block_K = hint.rstep[0]  # Block size in the K dimension
+
+                # Calculate the grid dimensions in M and N directions
+                grid_m = M // block_M
+                grid_n = N // block_N
+                total_grids = grid_m * grid_n  # Total number of grids
+
+                # Initialize the split-k factor (used to distribute K-dimension work across blocks)
+                split_k_factor = 1
+
+                # Optimize the split-k factor to minimize SM waste
+                while True:
+                    # Total grids after applying split-k
+                    total_grids_split_k = total_grids * split_k_factor
+
+                    # Calculate the waste in SMs after split-k distribution
+                    waste_sm_splitk = total_grids_split_k - (total_grids_split_k //
+                                                             num_sms) * num_sms
+                    waste_sm_splitk_ratio = waste_sm_splitk / total_grids_split_k
+
+                    # If the SM waste ratio is within the allowed threshold, stop optimization
+                    if waste_sm_splitk_ratio <= sm_waste_threshold:
+                        break
+
+                    # Double the split-k factor and check if the resulting K-dimension size is too large
+                    expand_split_k = split_k_factor * 2
+                    if K % (expand_split_k * block_K) != 0:
+                        break
+                    if expand_split_k * block_K >= K:
+                        break
+
+                    # Update the split-k factor for the next iteration
+                    split_k_factor = expand_split_k
+
+                # Note: The optimized split_k_factor can be stored or applied to the config if needed
+                hint.split_k_factor = split_k_factor
+
+            # Convert the hint to a configuration object using the TLHint mapping
             config = self.TLHint.from_roller_hint(hint)
+
             configs.append(config)
         return configs
 
@@ -126,6 +184,7 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
 
         num_stages = getattr(self, "num_stages", 2)
         enable_rasterization = getattr(self, "enable_rasterization", False)
+        split_k_factor = getattr(self, "split_k_factor", 1)
 
         return self.apply_config(
             block_row_warps=block_row_warps,
@@ -135,6 +194,7 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
             chunk=chunk,
             num_stages=num_stages,
             enable_rasterization=enable_rasterization,
+            split_k_factor=split_k_factor,
         )
 
     def apply_config(
@@ -145,7 +205,8 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
         warp_col_tiles: Optional[int] = None,
         chunk: Optional[int] = None,
         num_stages: Optional[int] = None,
-        enable_rasterization=False,
+        enable_rasterization: bool = False,
+        split_k_factor: Optional[int] = None,
     ):
         assert block_row_warps is not None, "block_row_warps is required"
         assert block_col_warps is not None, "block_col_warps is required"
@@ -154,13 +215,14 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
         assert chunk is not None, "chunk is required"
         assert num_stages is not None, "num_stages is required"
 
+        shared_scope = "shared.dyn"
         M = self.maybe_dynamic(self.M, "m")
         N, K = self.N, self.K
         assert isinstance(N, int) and isinstance(K, int), "Do not support dynamic N and K Currently"
         trans_A, trans_B = self.trans_A, self.trans_B
 
         assert trans_A is False, "Dequantize only implement for trans_A=False currently"
-        assert trans_B is True, "Dequantize only implement for trans_B=TRue currently"
+        assert trans_B is True, "Dequantize only implement for trans_B=True currently"
 
         in_dtype, out_dtype, accum_dtype = (
             self.in_dtype,
@@ -206,6 +268,8 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
         Zeros_shape = (N, K // group_size)
         Qzeros_shape = ((K // group_size), N // storage_nbit * num_bits)
         Bias_shape = (N,)
+
+        splitK = K // split_k_factor
 
         A_shared_shape = (block_M, block_K)
         B_shared_shape = (block_N, block_K // num_elems_per_byte)
@@ -256,7 +320,15 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
             chunk=chunk,
         )
 
-        cache_write_required = self.check_require_cache()
+        enable_split_k = split_k_factor > 1
+
+        def check_require_cache():
+            conditions = [False]
+            conditions.append(self.check_require_cache())
+            conditions.append(enable_split_k)
+            return any(conditions)
+
+        cache_write_required = check_require_cache()
 
         @T.prim_func
         def general_dequant_matmul(
@@ -266,15 +338,17 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
                 Scale: T.Buffer(Scale_shape, in_dtype),
                 Qzeros: T.Buffer(Qzeros_shape, storage_dtype),
                 Zeros: T.Buffer(Zeros_shape, in_dtype),
-                C: T.Buffer(C_shape, out_dtype),
                 Bias: T.Buffer(Bias_shape, in_dtype),
+                C: T.Buffer(C_shape, out_dtype),
         ):
             with T.Kernel(
-                    T.ceildiv(N, block_N), T.ceildiv(M, block_M), threads=threads) as (bx, by):
-                A_shared = T.alloc_shared(A_shared_shape, in_dtype)
-                B_shared = T.alloc_shared(B_shared_shape, storage_dtype)
-                B_dequantize_shared = T.alloc_shared(B_dequantize_shared_shape, in_dtype)
-                C_shared = T.alloc_shared(C_shared_shape, out_dtype)
+                    T.ceildiv(N, block_N), T.ceildiv(M, block_M), split_k_factor,
+                    threads=threads) as (bx, by, bz):
+                A_shared = T.alloc_shared(A_shared_shape, in_dtype, scope=shared_scope)
+                B_shared = T.alloc_shared(B_shared_shape, storage_dtype, scope=shared_scope)
+                B_dequantize_shared = T.alloc_shared(
+                    B_dequantize_shared_shape, in_dtype, scope=shared_scope)
+                C_shared = T.alloc_shared(C_shared_shape, out_dtype, scope=shared_scope)
 
                 A_frag = T.alloc_local((warp_rows * fragement_size_a), in_dtype)
                 B_frag = T.alloc_local((warp_cols * fragement_size_b), in_dtype)
@@ -299,10 +373,19 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
 
                 T.clear(C_frag)
 
-                for ko in T.Pipelined(T.ceildiv(K, block_K), num_stages=num_stages):
+                if enable_split_k:  # noqa: SIM102
+                    if bz == 0:
+                        for i, j in T.Parallel(block_M, block_N):
+                            m, n = by * block_M + i, bx * block_N + j
+                            C[m, n] = T.cast(0, out_dtype)
 
-                    T.copy(A[by * block_M, ko * block_K], A_shared)
-                    T.copy(B[bx * block_N, ko * block_K // num_elems_per_byte], B_shared)
+                for ko in T.Pipelined(T.ceildiv(splitK, block_K), num_stages=num_stages):
+
+                    T.copy(A[by * block_M, bz * splitK + ko * block_K], A_shared)
+                    T.copy(
+                        B[bx * block_N,
+                          bz * (splitK // num_elems_per_byte) + ko * block_K // num_elems_per_byte],
+                        B_shared)
 
                     for i in T.serial(block_N * block_K // num_elems_per_byte //
                                       (threads * local_size_compressed)):
@@ -320,13 +403,14 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
                             zeros_local,
                             dequant_qzeros_local,
                             B_dequantize_local,
+                            LUT,
                             Scale,
                             Zeros,
                             Qzeros,
                             local_size,
                             bx,
                             tx,
-                            ko,
+                            bz * T.ceildiv(splitK, block_K) + ko,
                             i,
                             block_N,
                             block_K,
@@ -362,6 +446,7 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
 
                         # Matrix multiplication on fragments
                         mma_emitter.mma(A_frag, B_frag, C_frag)
+
                 if cache_write_required:
                     # Store the result back to C shared memory
                     mma_emitter.stmatrix(
@@ -370,23 +455,46 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
                         thread_bindings=tx,
                     )
 
-                    if with_bias:
+                    if with_bias:  # noqa: SIM102
+                        if bz == 0:  # as bz is the k-dim, otherwise, bias will be added multiple times
+                            for i, j in T.Parallel(block_M, block_N):
+                                C_shared[
+                                    i // micro_size_x,
+                                    j // micro_size_y,
+                                    i % micro_size_x,
+                                    j % micro_size_y,
+                                ] += Bias[bx * block_N + j]
+
+                    # Store results from shared memory to global memory
+                    if enable_split_k:
+                        if DataType(out_dtype).bits == 16:
+                            for i, j in T.Parallel(block_M, block_N // 2):
+                                m, n = by * block_M + i, bx * block_N + j * 2
+                                T.atomic_addx2(
+                                    C[m, n], C_shared[
+                                        i // micro_size_x,
+                                        (j * 2) // micro_size_y,
+                                        i % micro_size_x,
+                                        (j * 2) % micro_size_y,
+                                    ])
+                        else:
+                            for i, j in T.Parallel(block_M, block_N):
+                                T.atomic_add(
+                                    C[by * block_M + i, bx * block_N + j], C_shared[
+                                        i // micro_size_x,
+                                        j // micro_size_y,
+                                        i % micro_size_x,
+                                        j % micro_size_y,
+                                    ])
+                    else:
                         for i, j in T.Parallel(block_M, block_N):
-                            C_shared[
+                            C[by * block_M + i, bx * block_N + j] = C_shared[
                                 i // micro_size_x,
                                 j // micro_size_y,
                                 i % micro_size_x,
                                 j % micro_size_y,
-                            ] += Bias[bx * block_N + j]
+                            ]
 
-                    # Store results from shared memory to global memory
-                    for i, j in T.Parallel(block_M, block_N):
-                        C[by * block_M + i, bx * block_N + j] = C_shared[
-                            i // micro_size_x,
-                            j // micro_size_y,
-                            i % micro_size_x,
-                            j % micro_size_y,
-                        ]
                 else:
                     # Store the result back to C global memory
                     mma_emitter.stmatrix(
@@ -401,7 +509,10 @@ class MatmulDequantizeFineGrainedScheduler(MatmulDequantizeBaseScheduler):
 
 
 @dataclass
-class MatmulINT4DequantizeFineGrainedScheduler(MatmulDequantizeFineGrainedScheduler):
+class MatmulINT4DequantizeMMAScheduler(MatmulDequantizeMMAScheduler):
+
+    class TLHint(MatmulDequantizeMMAScheduler.TLHint):
+        hint_type: str = "MatmulINT4DequantizeMMAScheduler"
 
     def get_roller_configs(self, arch: TileDevice = None, topk: int = 10):
         layout = f"{'t' if self.trans_A else 'n'}{'t' if self.trans_B else 'n'}"
@@ -463,7 +574,8 @@ class MatmulINT4DequantizeFineGrainedScheduler(MatmulDequantizeFineGrainedSchedu
         warp_col_tiles: Optional[int] = None,
         chunk: Optional[int] = None,
         num_stages: Optional[int] = None,
-        enable_rasterization=False,
+        enable_rasterization: bool = False,
+        split_k_factor: Optional[int] = None,
     ):
         assert block_row_warps is not None, "block_row_warps is required"
         assert block_col_warps is not None, "block_col_warps is required"
@@ -471,6 +583,8 @@ class MatmulINT4DequantizeFineGrainedScheduler(MatmulDequantizeFineGrainedSchedu
         assert warp_col_tiles is not None, "warp_col_tiles is required"
         assert chunk is not None, "chunk is required"
         assert num_stages is not None, "num_stages is required"
+        # unused variable
+        split_k_factor = split_k_factor
 
         M = self.maybe_dynamic(self.M, "m")
         N, K = self.N, self.K

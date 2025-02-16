@@ -3,7 +3,8 @@
 
 from typing import Union
 from tvm import arith, DataType
-import tvm.tl.language as T
+from bitblas import tilelang as tilelang
+import tilelang.language as T
 
 
 def ldmatrix_32x8_to_shared_16x16_layout(thread_id, local_id):
@@ -27,6 +28,18 @@ def ldmatrix_16x32_to_shared_16x32_layout_a(thread_id, local_id):
 def ldmatrix_16x32_to_shared_16x32_layout_b(thread_id, local_id):
     row = 8 * (thread_id // 16) + (thread_id % 8)
     col = 16 * ((thread_id % 16) // 8) + local_id % 16
+    return row, col
+
+
+def ldmatrix_32x16_to_shared_16x32_layout_a(thread_id, local_id):
+    row = thread_id % 16
+    col = local_id + (thread_id // 16) * 16
+    return row, col
+
+
+def ldmatrix_32x16_to_shared_16x32_layout_b(thread_id, local_id):
+    row = (thread_id // 16) * 8 + (thread_id % 8)
+    col = local_id + 16 * ((thread_id % 16) // 8)
     return row, col
 
 
@@ -108,12 +121,13 @@ def make_mma_swizzle_layout(shared_buf, is_smooth: bool = False):
     dtype = shared_buf.dtype
     shape = shared_buf.shape
 
-    can_swizzle = shape[-1] * DataType(dtype).bits == 512
-    if is_smooth or not can_swizzle:
+    can_swizzle = shape[-1] * DataType(dtype).bits % 512 == 0
+    if is_smooth or (not can_swizzle):
         return T.Layout(shape, lambda *args: args)
 
-    def transform_func(i, j):
+    def transform_func(*args):
+        i, j = args[-2:]
         new_warp_i, new_warp_j = get_swizzle_layout(i, j, shape[-1], dtype)
-        return [new_warp_i, new_warp_j]
+        return [*args[:-2], new_warp_i, new_warp_j]
 
     return T.Layout(shape, transform_func)

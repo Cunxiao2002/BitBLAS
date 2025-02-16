@@ -1,8 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 from abc import ABC, abstractmethod
-from bitblas import tvm
-from tvm import tl
+from bitblas import tvm as tvm
+from bitblas import tilelang as tilelang
 from tvm import IRModule
 from tvm.runtime.module import Module
 from tvm.target import Target
@@ -192,7 +192,7 @@ class Operator(object):
                     if self.is_tir_backend():
                         rt_mod = tvm.build(self.scheduled_ir_module, target=target)
                     elif self.is_tilelang_backend():
-                        rt_mod = tl.lower(
+                        rt_mod = tilelang.lower(
                             self.scheduled_ir_module, target=target, runtime_only=True)
                     else:
                         raise ValueError(f"Unsupported backend: {self.backend}")
@@ -236,7 +236,7 @@ class Operator(object):
                 raise ValueError(f"Unsupported target: {self.arch}")
         return rt_mod
 
-    def scheduler_with_default(self, scheduler: BaseScheduler):
+    def scheduler_with_default(self, scheduler: BaseScheduler) -> Optional[IRModule]:
         scheduled_ir_module = IRModule.from_expr(scheduler.with_default_config())
         if scheduled_ir_module is not None:
             self.ir_module = scheduled_ir_module
@@ -383,7 +383,7 @@ class Operator(object):
     def get_profile_tensors(self, dynamic_symbolic_constraints: Optional[Dict] = None):
         if dynamic_symbolic_constraints is None:
             dynamic_symbolic_constraints = {}
-        func = self.prim_func
+        func = self.prim_func or retrieve_func_from_module(self.scheduled_ir_module)
         device = self.arch.device
 
         def var_warpper(v):
@@ -501,7 +501,10 @@ class Operator(object):
         raise NotImplementedError
 
     @property
-    def prim_func(self):
+    def prim_func(self) -> Optional[PrimFunc]:
+        if self.ir_module is None:
+            return None
+
         if len(self.ir_module.get_global_vars()) == 1:
             return self.ir_module[self.ir_module.get_global_vars()[0]]
         elif "main" in self.ir_module:

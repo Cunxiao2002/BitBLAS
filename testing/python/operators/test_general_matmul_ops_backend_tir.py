@@ -33,7 +33,7 @@ def matmul_codegen_default(M, N, K, A_dtype, W_dtype, accum_dtype, out_dtype, la
         with_zeros=with_zeros,
         zeros_mode=zeros_mode,
     )
-    matmul = Matmul(config=matmul_config, enable_tuning=False)
+    matmul = Matmul(config=matmul_config, enable_tuning=False, backend="tir")
     assert get_codegen_result(matmul)
 
 
@@ -82,7 +82,7 @@ def matmul_finetune(M, N, K, A_dtype, W_dtype, accum_dtype, out_dtype, layout, w
         with_zeros=with_zeros,
         zeros_mode=zeros_mode,
     )
-    matmul = Matmul(config=matmul_config, enable_tuning=False)
+    matmul = Matmul(config=matmul_config, enable_tuning=False, backend="tir")
     matmul.hardware_aware_finetune(topk=10)
     assert get_codegen_result(matmul)
 
@@ -137,7 +137,7 @@ def matmul_torch_forward(M, N, K, A_dtype, W_dtype, accum_dtype, out_dtype, layo
         zeros_mode=zeros_mode,
         propagate_a=False,
     )
-    matmul = Matmul(config=matmul_config, enable_tuning=False)
+    matmul = Matmul(config=matmul_config, enable_tuning=False, backend="tir")
 
     input_shape = (M, K)
     weight_shape = (N, K) if layout == "nt" else (K, N)
@@ -248,7 +248,7 @@ def matmul_transform_weight(
         out_dtype=out_dtype,
         with_bias=with_bias,
     )
-    matmul = Matmul(config=matmul_config, enable_tuning=False)
+    matmul = Matmul(config=matmul_config, enable_tuning=False, backend="tir")
 
     input_shape = (M, K)
     weight_shape = (N, K)

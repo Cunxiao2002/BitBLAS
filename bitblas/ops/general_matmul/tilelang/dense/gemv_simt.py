@@ -1,9 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 from bitblas import tvm as tvm
+from bitblas import tilelang as tilelang
 from functools import reduce
 from typing import Optional, List
-import tvm.tl.language as T
+import tilelang.language as T
 from tvm import DataType
 from tvm.tir import PrimFunc
 
@@ -23,6 +24,8 @@ class GemvFineGrainSIMTScheduler(MatmulSIMTBaseScheduler):
     reduce_thread: int = 16
 
     class TLHint(BaseTLHint):
+
+        hint_type: str = "GemvFineGrainSIMTScheduler"
 
         def __init__(self):
             super().__init__()
@@ -55,6 +58,9 @@ class GemvFineGrainSIMTScheduler(MatmulSIMTBaseScheduler):
                     f"n_partition: {self.n_partition}, "
                     f"reduce_thread: {self.reduce_thread}, "
                     "}")
+
+    def get_hint_type(self):
+        return self.TLHint.hint_type
 
     def serialize_hints_to_configs(self, hints: List[Hint]):
         configs = []
@@ -106,8 +112,8 @@ class GemvFineGrainSIMTScheduler(MatmulSIMTBaseScheduler):
 
         A_shape = (M, K)
         B_shape = (N, K)
-        C_shape = (M, N)
         Bias_shape = (N,)
+        C_shape = (M, N)
 
         dp4a_size = 4
         use_dp4a = in_dtype == "int8" and accum_dtype == "int32"
@@ -116,8 +122,8 @@ class GemvFineGrainSIMTScheduler(MatmulSIMTBaseScheduler):
         def main(
                 A: T.Buffer(A_shape, in_dtype),
                 B: T.Buffer(B_shape, in_dtype),
-                C: T.Buffer(C_shape, out_dtype),
                 Bias: T.Buffer(Bias_shape, out_dtype),
+                C: T.Buffer(C_shape, out_dtype),
         ):
             with T.Kernel(
                     T.ceildiv(N, n_partition), M, threads=(reduce_thread, n_partition)) as (
@@ -152,7 +158,8 @@ class GemvFineGrainSIMTScheduler(MatmulSIMTBaseScheduler):
                             )
                     else:
                         for ki in T.serial(micro_size_k):
-                            accum_res[0] += A_local[ki] * B_local[ki]
+                            accum_res[0] += A_local[ki].astype(accum_dtype) * B_local[ki].astype(
+                                accum_dtype)
 
                 with T.attr(
                         T.comm_reducer(lambda x, y: x + y, [T.Cast(accum_dtype, 0)]),
@@ -181,5 +188,4 @@ class GemvFineGrainSIMTScheduler(MatmulSIMTBaseScheduler):
         # Validate the matrix transpose settings
         assert self.trans_A is False, "Currently only support Matrix A not transposed"
         assert self.trans_B is True, "Currently only support Matrix B transposed"
-        assert self.with_bias is False, "Currently only support without bias"
         return

@@ -1,9 +1,13 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+from bitblas import tvm as tvm
+from bitblas import tilelang as tilelang
 from tvm import te
 from tvm import IRModule
 from tvm.tir import PrimFunc
 from typing import Optional, Union, Callable, List, Dict
 from dataclasses import dataclass, field
-from tvm.tl.transform import Simplify
+from tilelang.transform import Simplify
 from abc import ABC, abstractmethod
 from bitblas.base.arch import TileDevice, is_volta_arch, is_ampere_arch, is_cdna_arch, auto_infer_current_arch
 from bitblas.base.roller.hint import Hint
@@ -112,6 +116,9 @@ class BaseScheduler(ABC):
         **kwargs,
     ) -> PrimFunc:
         pass
+
+    def get_hint_type(self) -> str:
+        raise NotImplementedError("Get Hint type is not implemented")
 
     def serialize_hints_to_configs(self, hints: List[Hint]) -> List[BaseTLHint]:
         # Convert Roller Hints to TileLang Hints

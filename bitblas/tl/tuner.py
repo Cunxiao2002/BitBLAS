@@ -1,7 +1,8 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from bitblas import tvm
+from bitblas import tvm as tvm
+from bitblas import tilelang as tilelang
 import os
 import logging
 import tempfile
@@ -10,7 +11,6 @@ from typing import List, Tuple, Optional
 from tvm import IRModule
 from tvm.runtime import Module
 from tvm.tir import Schedule
-import tvm.tl as tl
 from bitblas.tl.base_hint import BaseTLHint
 from bitblas.base.arch import TileDevice
 from bitblas.base.utils import get_dummy_input_arrays
@@ -72,7 +72,7 @@ def apply_and_build_parallel(scheduler,
                              arch,
                              num_repeats=3,
                              max_workers=10,
-                             timeout=30,
+                             timeout=60,
                              data_distribution="uniform") -> CompileResult:
     cpresults = []
 
@@ -122,7 +122,7 @@ def apply_and_build_parallel(scheduler,
                     "tir.disable_cse_tir": True,
                     **(config.pass_context if config.pass_context else {})
                 }):
-            rt_mod = tl.lower(tl_prim_func, arch.target, runtime_only=True)
+            rt_mod = tilelang.lower(tl_prim_func, arch.target, runtime_only=True)
 
         from tvm.contrib.tar import tar  # Import the tar module
 
@@ -140,11 +140,14 @@ def apply_and_build_parallel(scheduler,
 
         for future in as_completed(future_to_idx, timeout=timeout):
             idx = future_to_idx[future]
+            assert idx <= len(_scheduled_ir_modules), "Index out of range"
+            assert idx <= len(configs), "Index out of range"
+
+            ir_module = _scheduled_ir_modules[idx]
+            config = configs[idx]
             try:
                 idx, code, artifact_path = future.result()
-                ir_module = _scheduled_ir_modules[idx]
                 sch = tvm.tir.Schedule(ir_module)
-                config = configs[idx]
 
                 if artifact_path is None:
                     ARTIFACT_NOT_FOUND = f"Apply config {config} failed, artifact path is None"
@@ -165,7 +168,7 @@ def apply_and_build_parallel(scheduler,
                     local_build_error = (
                         local_build_error[:MAX_ERROR_MESSAGE_LENGTH] + "\t...\t" +
                         local_build_error[-MAX_ERROR_MESSAGE_LENGTH:])
-                logger.error(f"An exception occurred for index {idx}: {local_build_error}")
+                logger.error(f"An exception occurred for hint {config}: {local_build_error}")
 
     best = None
     best_latency = 1e9
