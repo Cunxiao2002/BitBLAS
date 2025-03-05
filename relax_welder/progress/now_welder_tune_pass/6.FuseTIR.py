@@ -1,5 +1,8 @@
+
 from hmac import new
+from syslog import LOG_ALERT
 from types import ModuleType
+from numpy import block
 from tvm.script import ir as I
 from tvm.script import tir as T
 from tvm.script import relax as R
@@ -9,6 +12,8 @@ from tvm.script.ir_builder.tir.ir import thread_binding
 from tvm.tir import stmt_functor
 from tvm import ir, transform, relax
 import os
+
+from tvm.tir.transform.transform import TransformMmaBufferLayout
 
 
 fname = os.path.basename(__file__)
@@ -299,233 +304,172 @@ class MyModule:
         return gv
 
 
-# (issue)用于将primfunc2的body移动到primfunc1 loop下面
-def MoveInitLoopPass():
-    extracted_loop = None
-    target_loop_found = False
-    
-    def _pre_visit(stmt):
-        nonlocal extracted_loop, target_loop_found
-        
-        if isinstance(stmt, tvm.tir.For) and stmt.loop_var.name == "ax2_0_2" and extracted_loop is None:
-            # Look for the nested grid loop with ax1_0_3_init and ax2_0_3_init
-            # print(f"the pre stmt is \n{stmt}")
-            # print("------------------------------------------------------")
-            # print(f"stmt.body is \n{stmt.body}")
-            # print("------------------------------------------------------")
-            # print(f"type of stmt.body is {type(stmt.body)}")
-            # print("------------------------------------------------------")
-            # print(f"the type of body's first stmt is {type(stmt.body[0])}")
-            # print("------------------------------------------------------")
-            # print(f"the body's first stmt is \n{stmt.body[0]}")
-            # print("------------------------------------------------------")
+class VmapCollector():
+    vmap_collector = {}
+    name_map = {}
+    buffer_name_map = {}
+    buffer_vmap = {}
 
-            # print("------------------------------------------------------")
-            # print(f"stmt.body is of type: {type(stmt.body)}")
-            # print("------------------------------------------------------")
-            # if hasattr(stmt.body, "__len__"):
-            #     print(f"stmt.body has {len(stmt.body)} elements")
-            #     for i, s in enumerate(stmt.body):
-            #         print(f"Element {i} is of type: {type(s)}")
-            #         if hasattr(s, "name_hint"):
-            #             print(f"Element {i} name_hint: {s.name_hint}")
-            #         else:
-            #             print(f"Element {i} does not have name_hint attribute")
-            #         print(f"Element {i}: {s}")
-            #         print("------------------------------------------------------")
+    @staticmethod
+    def get_vmap():
+        return VmapCollector.vmap_collector
 
-            for_body = stmt.body[0].body.body.block
-            # print("------------------------------------------------------")
-            # print(f"the type of for_body'body is {type(for_body.body)}")
-            # print("------------------------------------------------------")
-            # print(f"for_body‘s is \n{for_body.body.body.block}\n")
-            # print("------------------------------------------------------")
-            # print(f"the for_body's type {type(for_body)}")
-            # print("------------------------------------------------------")
-            if isinstance(for_body, tvm.tir.Block) and for_body.name_hint == "gemm_o_init_1":
-                # for_body = for_body.body
-                # print(f"for body is\n {for_body}")
-                # print("------------------------------------------------------")
-                extracted_loop = stmt.body
-                # print(f"extracted_loop is \n {extracted_loop}")
-                # print("------------------------------------------------------")
-                return None
-            
-            if isinstance(for_body, tvm.tir.For) and for_body.loop_var.name == "ax1_0_3_init":
-                # print(f"the for_body is \n{for_body}")
-                # Found the loop we want to extract
-                extracted_loop = for_body
-                # Return None to continue traversal
-                # print("------------------------------------------------------")
-                # print(f"extracted_loop is \n {extracted_loop}")
-                # print("------------------------------------------------------")
-                return None
-        
-        if isinstance(stmt, tvm.tir.For) and stmt.loop_var.name == "ax2_0_2" and extracted_loop is not None and not target_loop_found:
-            target_loop_found = True
-            return None
-
-        return None
-    
-    def _post_visit(stmt):
-        nonlocal extracted_loop, target_loop_found
-        # print(f"type of post stmt: {type(stmt)}")
-        # print(f"target_loop_found is {target_loop_found}\n")
-        if isinstance(stmt, tvm.tir.For) and stmt.loop_var.name == "ax2_0_2" and extracted_loop is not None and target_loop_found:
-            block_detect = stmt.body[0].body.body.block
-            # print("------------------------------------------------------")
-            # print(f'block_detect is {block_detect}')
-            # print("------------------------------------------------------")
-            if isinstance(block_detect, tvm.tir.Block) and block_detect.name_hint == "gemm_o_init":
-                # print("------------------------------------------------------")
-                # print(f"post_stmt's body is {stmt.body}\n")
-                # print("------------------------------------------------------")
-                new_body = tvm.tir.SeqStmt([stmt.body, extracted_loop])
-                # print("------------------------------------------------------")
-                # print(f"new_body is \n{new_body}")
-                # print("------------------------------------------------------")
-                
-                # print(f"stmt.loop_var is {stmt.loop_var}")
-                new_stmt = tvm.tir.For(
-                    loop_var=stmt.loop_var,
-                    min=stmt.min,
-                    extent=stmt.extent,
-                    kind=stmt.kind,
-                    body=new_body,
-                    thread_binding=stmt.thread_binding,
-                    annotations=stmt.annotations
-                )
-
-                # print("------------------------------------------------------")
-                # print(f"new_stmt is \n{new_stmt}")
-                # print("------------------------------------------------------")
-                
-                target_loop_found = False
-                
-                return new_stmt
-        
-        return stmt
-    
-    def _ftransform(f, mod, ctx):
-        return f.with_body(
-            tvm.tir.stmt_functor.ir_transform(
-                f.body,
-                _pre_visit,
-                _post_visit,
-                ["tir.For", "tir.Block"]
-            )
-        )
-    
-    # Return a pass that applies the transformation
-    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+    @staticmethod
+    def reset_vmap():
+        VmapCollector.vmap_collector = {}
 
 
 # 
-def ExtractAndSubstituteLoopVarsPass():
-    """
-    A pass that extracts loop variables from two different sections of a TIR function
-    and substitutes the second set with the first set using the substitute method.
-    """
-    # Variables to store the extracted loop vars
-    loop_vars1 = {}
-    loop_vars2 = {}
-    first_section_found = False
-    second_section_found = False
-    
+def BufferNameMap():
     def _pre_visit(stmt):
-        nonlocal loop_vars1, loop_vars2, first_section_found, second_section_found
-        
-        # Extract loop vars from the first section
-        if isinstance(stmt, tvm.tir.For) and stmt.loop_var.name == "ax0" and not first_section_found:
-            # if tvm.tir.all(stmt.thread_binding != 0, stmt.thread_binding.thread_tag == "blockIdx.z"):
-            if stmt.thread_binding is not None:
-                if stmt.thread_binding.thread_tag == "blockIdx.z":
-                    first_section_found = True
-                    loop_vars1["ax0"] = stmt.loop_var
-                    
-                    # Extract nested loop vars
-                    body = stmt.body
-                    if isinstance(body, tvm.tir.For) and body.loop_var.name == "ax1_0_0_ax2_0_0_fused":
-                        loop_vars1["ax1_0_0_ax2_0_0_fused"] = body.loop_var
-                        
-                        body = body.body
-                        if isinstance(body, tvm.tir.For) and body.loop_var.name == "ax1_0_1_ax2_0_1_fused":
-                            loop_vars1["ax1_0_1_ax2_0_1_fused"] = body.loop_var
-                            
-                            body = body.body
-                            if isinstance(body, tvm.tir.For) and body.loop_var.name == "ax1_0_2":
-                                loop_vars1["ax1_0_2"] = body.loop_var
-                                
-                                body = body.body
-                                if isinstance(body, tvm.tir.For) and body.loop_var.name == "ax2_0_2":
-                                    loop_vars1["ax2_0_2"] = body.loop_var
-            
-        # Extract loop vars from the second section
-        elif isinstance(stmt, tvm.tir.For) and stmt.loop_var.name == "ax0" and first_section_found and not second_section_found:
-            # if (stmt.thread_binding and stmt.thread_binding.thread_tag == "blockIdx.z"):
-            if stmt.thread_binding is not None:
-                if stmt.thread_binding.thread_tag == "blockIdx.z":
-                    second_section_found = True
-                    loop_vars2["ax0"] = stmt.loop_var
-                    
-                    # Extract nested loop vars
-                    body = stmt.body
-                    if isinstance(body, tvm.tir.For) and body.loop_var.name == "ax1_0_0_ax2_0_0_fused":
-                        loop_vars2["ax1_0_0_ax2_0_0_fused"] = body.loop_var
-                        
-                        body = body.body
-                        if isinstance(body, tvm.tir.For) and body.loop_var.name == "ax1_0_1_ax2_0_1_fused":
-                            loop_vars2["ax1_0_1_ax2_0_1_fused"] = body.loop_var
-                            
-                            body = body.body
-                            if isinstance(body, tvm.tir.For) and body.loop_var.name == "ax1_0_2":
-                                loop_vars2["ax1_0_2"] = body.loop_var
-                                
-                                body = body.body
-                                if isinstance(body, tvm.tir.For) and body.loop_var.name == "ax2_0_2":
-                                    loop_vars2["ax2_0_2"] = body.loop_var
-        
+        pass
+
+
+
+# 创建VmapCollector中所需要的name_map
+def CreateNameMap():
+    var_targets = ["ax0", "ax1_0_0_ax2_0_0_fused", "ax1_0_1_ax2_0_1_fused", "ax1_0_2", "ax2_0_2"]
+    # 改成thread bindings
+    def _pre_visit(stmt):
+        if stmt.name in var_targets:
+            var_targets.remove(stmt.name)
+            VmapCollector.name_map[stmt.name] = stmt
         return None
     
+    def _ftransform(f, mod, ctx):
+        return f.with_body(tvm.tir.stmt_functor.ir_transform(f.body, _pre_visit, None, ["tir.Var"]))
+
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
+# 创建需要替换的vmap
+def CreateVmap():
+    var_targets = ["ax0_1", "ax1_0_0_ax2_0_0_fused_1", "ax1_0_1_ax2_0_1_fused_1", "ax1_0_2_1", "ax2_0_2_1"]
+
+    def _pre_visit(stmt):
+        if isinstance(stmt, tir.Var) and stmt.name in var_targets:
+            # print(f"Processing var: {stmt.name} (id={id(stmt)})")
+            VmapCollector.vmap_collector[stmt] = VmapCollector.name_map[stmt.name.replace("_1", "")]
+        
+    def _ftransform(f, mod, ctx):
+        return f.with_body(tvm.tir.stmt_functor.ir_transform(f.body, _pre_visit, None, ["tir.Var"]))
+
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
+# 使用创建好的vmap进行substitute
+def SubstituteVmap():    
+    var_targets = ["ax0_1", "ax1_0_0_ax2_0_0_fused_1", "ax1_0_1_ax2_0_1_fused_1", "ax1_0_2_1", "ax2_0_2_1"]
     def _post_visit(stmt):
-        nonlocal loop_vars1, loop_vars2, first_section_found, second_section_found
-        
-        # If we've found both sections and have all loop vars, perform substitution
-        if first_section_found and second_section_found and loop_vars1 and loop_vars2:
-            # Create variable mapping
-            vmap = {}
-            for name, var in loop_vars2.items():
-                if name in loop_vars1:
-                    vmap[var] = loop_vars1[name]
-                    
-            
-            # Apply substitution
-            # print("------------------------------------------------------")
-            # print(f"type of stmt is {type(stmt)}\n")
-            # print("------------------------------------------------------")
-            # print(f"stmt is \n{stmt}")
-            # print("------------------------------------------------------")
-            # print(f"vmap is \n{vmap}")
-            # print("------------------------------------------------------")
-            # new_stmt = tvm.tir.stmt_functor.substitute(stmt, vmap)
-            # print("------------------------------------------------------")
-            # print(f"new_stmt is \n{new_stmt}")
-            # print("------------------------------------------------------")
+        if isinstance(stmt, tir.Var) and stmt.name in var_targets:
+            # print(f"after substitute, Var is {stmt}")
+            vmap = VmapCollector.get_vmap()
             return tvm.tir.stmt_functor.substitute(stmt, vmap)
-        
         return stmt
     
     def _ftransform(f, mod, ctx):
         return f.with_body(
             tvm.tir.stmt_functor.ir_transform(
                 f.body,
-                _pre_visit,
+                None,
                 _post_visit,
+                # ["tir.Var"]
+            )
+        )
+    
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
+
+
+def VisitAllNode():
+
+    def _pre_visit(stmt):
+        print(f"Visiting node of type: {type(stmt)}")
+        print(f"Visiting node {stmt}")
+        print("----------------------------------------------------------------------------------")
+        return None
+    
+    def _ftransform(f, mod, ctx):
+        return f.with_body(
+            tvm.tir.stmt_functor.ir_transform(
+                f.body,
+                _pre_visit,
+                None,
+                # ["tir.Var"]
+            )
+        )
+
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
+
+
+class ForCollector:
+    collected_for = None
+
+    @staticmethod
+    def reset():
+        ForCollector.collected_for = None
+
+    @staticmethod
+    def get_for():
+        return ForCollector.collected_for
+
+# 收集For node相关的信息
+def CollectForPass():
+    for_name = "ax2_0_2"
+    first_found = False
+    def _pre_visit(stmt):
+        if isinstance(stmt, tir.For) and stmt.loop_var.name == for_name and not first_found :
+            # print(stmt)
+            ForCollector.collected_for = stmt
+        
+        return None
+
+    def _ftransform(func, mod, ctx):
+        return func.with_body(
+            tvm.tir.stmt_functor.ir_transform(
+                func.body,
+                _pre_visit,
+                None,  # 不需要post_visit
                 ["tir.For"]
             )
         )
     
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
+def ParseFor():
+    target_loop_var = "ax2_0_2"
+
+    def _pre_visit(stmt):
+        if isinstance(stmt, tir.For):
+            return None            
+        return stmt
+
+    def _post_visit(stmt):
+        if isinstance(stmt, tir.For) and stmt.loop_var.name == target_loop_var:
+            collected_for = ForCollector.get_for()
+            # print(f"collected_for is {collected_for}")
+            if collected_for is not None:
+                return tvm.tir.For(
+                    loop_var=stmt.loop_var,
+                    min=stmt.min,
+                    extent=stmt.extent,
+                    kind=stmt.kind,
+                    body=tvm.tir.SeqStmt([stmt.body[0], stmt.body[1], stmt.body[2], collected_for.body[0], collected_for.body[1], collected_for.body[2]]),
+                    thread_binding=stmt.thread_binding,
+                    annotations=stmt.annotations
+                )
+
+    def _ftransform(func, mod, ctx):
+        return func.with_body(
+            tvm.tir.stmt_functor.ir_transform(
+                func.body,
+                None,
+                _post_visit,
+                ["tir.For"]
+            )
+        )
+
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+            
 
 # this pass can remove the prim_func2 from fused_primfunc
 def RemoveSpecificForNodePass():
@@ -540,59 +484,20 @@ def RemoveSpecificForNodePass():
     """
     first_occurrence_found = False
     second_occurrence_removed = False
+    temp = 0
 
     
     def _pre_visit(stmt):
         return None
     
     def _post_visit(stmt):
-        nonlocal first_occurrence_found, second_occurrence_removed
+        nonlocal first_occurrence_found, second_occurrence_removed, temp
         
         # Check if this is the target for node structure
         if isinstance(stmt, tvm.tir.For) and stmt.loop_var.name == "ax0" and not second_occurrence_removed:
-            if (stmt.thread_binding is not None and 
-                stmt.thread_binding.thread_tag == "blockIdx.z"):
-                
-                body = stmt.body
-                # print(f"the body is \n {body}")
-                if (isinstance(body, tvm.tir.For) and 
-                    body.loop_var.name == "ax1_0_0_ax2_0_0_fused" and 
-                    body.thread_binding is not None and 
-                    body.thread_binding.thread_tag == "blockIdx.y"):
-                    
-                    body = body.body
-                    # print(f"the body is \n {body}")
-                    if (isinstance(body, tvm.tir.For) and 
-                        body.loop_var.name == "ax1_0_1_ax2_0_1_fused" and 
-                        body.thread_binding is not None and 
-                        body.thread_binding.thread_tag == "blockIdx.x"):
-                        
-                        body = body.body
-                        if (isinstance(body, tvm.tir.For) and 
-                            body.loop_var.name == "ax1_0_2" and 
-                            body.thread_binding is not None and 
-                            body.thread_binding.thread_tag == "threadIdx.y"):
-                            
-                            body = body.body[0]
-                            # print(f"the body is \n {body}")
-                            # print("--------------------------------")
-                            # print(f"the type of the body{type(body)}")
-                            # print("--------------------------------")
-                            if (isinstance(body, tvm.tir.For) and 
-                                body.loop_var.name == "ax2_0_2" and 
-                                body.thread_binding is not None and 
-                                body.thread_binding.thread_tag == "threadIdx.z"):
-                                if not first_occurrence_found:
-                                    first_occurrence_found = True
-                                    return stmt
-                                # We found the target structure, mark it and return an empty statement
-                                else:
-                                    second_occurrence_removed = True
-                                    return tvm.tir.Evaluate(tvm.tir.const(0, "int32"))
-                                # print(f"the body is \n {body}")
-                                # print("--------------------------------")
-                                # print(f"substitute stmt is \n{stmt}")
-                                # print("--------------------------------")
+            temp += 1
+            if(temp == 2):
+                return tvm.tir.Evaluate(tvm.tir.const(0, "int32"))
         
         return stmt
     
@@ -608,11 +513,230 @@ def RemoveSpecificForNodePass():
     
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
 
+
+def RemoveFor():
+    temp_1 = 0
+    temp_2 = 0
+    def _post_visit(stmt):
+        nonlocal temp_1, temp_2
+        if stmt.loop_var.name == "ax1_0_3_init":
+            temp_1 += 1
+            if temp_1 == 2:
+                return tvm.tir.Evaluate(tvm.tir.const(0, "int32"))
+        if stmt.loop_var.name == "ax3_0_0":
+            temp_2 += 1
+            if temp_2 == 2:
+                new_body = list(stmt.body)
+                new_body.pop(0)
+                new_seq = tvm.tir.SeqStmt(new_body)
+                new_for = tvm.tir.For(
+                    loop_var=stmt.loop_var,
+                    min=stmt.min,
+                    extent=stmt.extent,
+                    kind=stmt.kind,
+                    body=new_seq,
+                    thread_binding=stmt.thread_binding,
+                    annotations=stmt.annotations,
+                    span=stmt.span
+                )
+                return new_for
+        return stmt
+
+    def _ftransform(f, mod, ctx):
+        return f.with_body(
+            tvm.tir.stmt_functor.ir_transform(
+                f.body,
+                None,
+                _post_visit,
+                ["tir.For"]
+            )
+        )
+    
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
+
+
+
+# can replace all the buffer(A_reindex_shared_dyn_1 -> C_reindex_shared_dyn)
+# buffer(A_reindex_shared_dyn_warp_1 -> C_reindex_shared_dyn_warp)  
+# maybe should change the name index to thread_bingding index
+def ReplaceBufferPass():
+    # Dictionary to store the mapping from source buffer to target buffer
+    buffer_map = {}
+    target_buffers = {}
+
+    def _pre_visit(stmt):
+        if isinstance(stmt, tir.Block):
+            # First, find the target buffers in reads or writes
+            if "C_reindex_shared_dyn" not in target_buffers:
+                for read in stmt.reads:
+                    if read.buffer.name == "C_reindex_shared_dyn":
+                        target_buffers["C_reindex_shared_dyn"] = read.buffer
+                        break
+                if "C_reindex_shared_dyn" not in target_buffers:
+                    for write in stmt.writes:
+                        if write.buffer.name == "C_reindex_shared_dyn":
+                            target_buffers["C_reindex_shared_dyn"] = write.buffer
+                            break
+            
+            if "C_reindex_shared_dyn_warp" not in target_buffers:
+                for read in stmt.reads:
+                    if read.buffer.name == "C_reindex_shared_dyn_warp":
+                        target_buffers["C_reindex_shared_dyn_warp"] = read.buffer
+                        break
+                if "C_reindex_shared_dyn_warp" not in target_buffers:
+                    for write in stmt.writes:
+                        if write.buffer.name == "C_reindex_shared_dyn_warp":
+                            target_buffers["C_reindex_shared_dyn_warp"] = write.buffer
+                            break
+            
+            # Then, find the source buffers and map them to the targets
+            for read in stmt.reads:
+                if read.buffer.name == "A_reindex_shared_dyn_1":
+                    if "C_reindex_shared_dyn" in target_buffers:
+                        buffer_map[read.buffer] = target_buffers["C_reindex_shared_dyn"]
+                elif read.buffer.name == "A_reindex_shared_dyn_warp_1":
+                    if "C_reindex_shared_dyn_warp" in target_buffers:
+                        buffer_map[read.buffer] = target_buffers["C_reindex_shared_dyn_warp"]
+            
+            for write in stmt.writes:
+                if write.buffer.name == "A_reindex_shared_dyn_1":
+                    if "C_reindex_shared_dyn" in target_buffers:
+                        buffer_map[write.buffer] = target_buffers["C_reindex_shared_dyn"]
+                elif write.buffer.name == "A_reindex_shared_dyn_warp_1":
+                    if "C_reindex_shared_dyn_warp" in target_buffers:
+                        buffer_map[write.buffer] = target_buffers["C_reindex_shared_dyn_warp"]
+        return None
+
+    def _post_visit(stmt):
+        if isinstance(stmt, tir.Block):
+            # Replace buffer references in reads
+            new_reads = []
+            for read in stmt.reads:
+                if read.buffer in buffer_map:
+                    # Create a new BufferRegion with the target buffer
+                    new_reads.append(tir.BufferRegion(buffer_map[read.buffer], read.region))
+                else:
+                    new_reads.append(read)
+            
+            # Replace buffer references in writes
+            new_writes = []
+            for write in stmt.writes:
+                if write.buffer in buffer_map:
+                    # Create a new BufferRegion with the target buffer
+                    new_writes.append(tir.BufferRegion(buffer_map[write.buffer], write.region))
+                else:
+                    new_writes.append(write)
+            
+            
+            # Create a new block with updated reads and writes if needed
+            new_match_buffers = []
+            for match in stmt.match_buffers:
+                if match.source.buffer in buffer_map:
+                    # Create a new BufferRegion with the target buffer
+                    new_source = tir.BufferRegion(buffer_map[match.source.buffer], match.source.region)
+                    # Create a new MatchBufferRegion with the new source
+                    new_match_buffers.append(tir.MatchBufferRegion(match.buffer, new_source))
+                else:
+                    new_match_buffers.append(match)
+            
+            # Create a new block with updated reads, writes, and match_buffers if needed
+            if new_reads != stmt.reads or new_writes != stmt.writes or new_match_buffers != stmt.match_buffers:
+                return tir.Block(
+                    stmt.iter_vars,
+                    new_reads,
+                    new_writes,
+                    stmt.name_hint,
+                    stmt.body,
+                    stmt.init,
+                    stmt.alloc_buffers,
+                    new_match_buffers,  # Use the new match_buffers
+                    stmt.annotations
+                )
+        
+        return stmt
+
+    def _ftransform(f, mod, ctx):
+        # First perform the transform to populate the buffer_map
+        result = f.with_body(tvm.tir.stmt_functor.ir_transform(
+            f.body,
+            _pre_visit,
+            _post_visit,
+            ["tir.Block", "tir.BufferLoad", "tir.BufferStore"]
+        ))
+        
+        # Print the buffer mapping for debugging after the transform
+        print(f"Found {len(buffer_map)} buffers to replace")
+        for src, tgt in buffer_map.items():
+            print(f"Replacing {src.name} with {tgt.name}")
+            
+        return result
+
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+            
+
+
+def BlockInfo():
+    def _pre_visit(stmt):
+        print(f"the Block is\n {stmt}")
+        print(f"the BLock's iter_values is {stmt.iter_vars}")
+        print(f"the Block's reads is {stmt.reads}")
+        print(f"the Block's writes is {stmt.writes}")
+        print(f"the Block's name_hint is\n {stmt.name_hint}")
+        print(f"the Block's body is\n {stmt.body}")
+        print(f"the Block's init is {stmt.init}")
+        print(f"the Block's alloc_buffers is {stmt.alloc_buffers}")
+        print(f"the Block's match_buffers is {stmt.match_buffers}")
+        print(f"the Block's annotations is {stmt.annotations}")
+        print("---------------------------------------------------------------------------------------------------------------------------------")
+        return None
+
+    def _ftransform(f, mod, ctx):
+        return f.with_body(
+            tvm.tir.stmt_functor.ir_transform(
+                f.body,
+                _pre_visit,
+                None,
+                ["tir.Block"]
+            )
+        )
+    
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
 # Load the module
 mod = MyModule
-# MoveInitLoopPass_1 = MoveInitLoopPass()
+
 # Apply the pass
-# transformed_mod = MoveInitLoopPass()(mod)
-transformed_mod = ExtractAndSubstituteLoopVarsPass()(mod)
-# transformed_mod = RemoveSpecificForNodePass()(mod)
-print(transformed_mod.script())
+
+
+transformed_mod = CollectForPass()(mod)
+write_mod(transformed_mod, log_path, "Basic")
+# transform_mod = SubstituteVmap()(transformed_mod)
+# write_mod(transformed_mod, log_path, "SubstituteVmap")
+transformed_mod = ParseFor()(transformed_mod)
+write_mod(transformed_mod, log_path, "ParseFor")
+transformed_mod = RemoveSpecificForNodePass()(transformed_mod)
+write_mod(transformed_mod, log_path, "RemoveSpecificForNodePass")
+transformed_mod = RemoveFor()(transformed_mod)
+write_mod(transformed_mod, log_path, "RemoveFor")
+# transformed_mod = VisitAllNode()(transformed_mod)
+# transformed_mod = BlockInfo()(transformed_mod)
+transformed_mod = ReplaceBufferPass()(transformed_mod)
+write_mod(transformed_mod, log_path, "ReplaceBufferPass")
+
+# transformed_mod = CreateNameMap()(transformed_mod)
+# transformed_mod = CreateVmap()(transformed_mod)
+# transformed_mod = SubstituteVmap()(transformed_mod)
+# write_mod(transformed_mod, log_path, "SubstituteVmap")
+
+
+print(f"Vampcollector.name_map is {VmapCollector.name_map}")
+print(f"VmapCollector.vmap is {VmapCollector.get_vmap()}")
+# for var, mapped_var in VmapCollector.get_vmap().items():
+#     print(f"Key[id={id(var)}]: {type(var).__name__} (Name: {var.name}), "
+#           f"Value[id={id(mapped_var)}]: {type(mapped_var).__name__} "
+#           f"(Name: {mapped_var.name if hasattr(mapped_var, 'name') else 'N/A'})")
+
+
+# print(transformed_mod.script())
+# print(f"the ForCollector.collected_for is \n{ForCollector.collected_for}")
