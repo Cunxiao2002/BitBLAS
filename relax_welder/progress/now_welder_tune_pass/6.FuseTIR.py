@@ -3,6 +3,7 @@ from hmac import new
 from syslog import LOG_ALERT
 from types import ModuleType
 from numpy import block
+from tvm import target
 from tvm.script import ir as I
 from tvm.script import tir as T
 from tvm.script import relax as R
@@ -13,6 +14,7 @@ from tvm.tir import stmt_functor
 from tvm import ir, transform, relax
 import os
 
+from tvm.tir.stmt import ForKind
 from tvm.tir.transform.transform import TransformMmaBufferLayout
 
 
@@ -304,99 +306,32 @@ class MyModule:
         return gv
 
 
-class VmapCollector():
-    vmap_collector = {}
-    name_map = {}
-    buffer_name_map = {}
-    buffer_vmap = {}
 
-    @staticmethod
-    def get_vmap():
-        return VmapCollector.vmap_collector
-
-    @staticmethod
-    def reset_vmap():
-        VmapCollector.vmap_collector = {}
-
-
-# 
-def BufferNameMap():
-    def _pre_visit(stmt):
-        pass
-
-
-
-# 创建VmapCollector中所需要的name_map
-def CreateNameMap():
-    var_targets = ["ax0", "ax1_0_0_ax2_0_0_fused", "ax1_0_1_ax2_0_1_fused", "ax1_0_2", "ax2_0_2"]
-    # 改成thread bindings
-    def _pre_visit(stmt):
-        if stmt.name in var_targets:
-            var_targets.remove(stmt.name)
-            VmapCollector.name_map[stmt.name] = stmt
-        return None
-    
-    def _ftransform(f, mod, ctx):
-        return f.with_body(tvm.tir.stmt_functor.ir_transform(f.body, _pre_visit, None, ["tir.Var"]))
-
-    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
-
-# 创建需要替换的vmap
-def CreateVmap():
-    var_targets = ["ax0_1", "ax1_0_0_ax2_0_0_fused_1", "ax1_0_1_ax2_0_1_fused_1", "ax1_0_2_1", "ax2_0_2_1"]
-
-    def _pre_visit(stmt):
-        if isinstance(stmt, tir.Var) and stmt.name in var_targets:
-            # print(f"Processing var: {stmt.name} (id={id(stmt)})")
-            VmapCollector.vmap_collector[stmt] = VmapCollector.name_map[stmt.name.replace("_1", "")]
-        
-    def _ftransform(f, mod, ctx):
-        return f.with_body(tvm.tir.stmt_functor.ir_transform(f.body, _pre_visit, None, ["tir.Var"]))
-
-    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
-
-# 使用创建好的vmap进行substitute
-def SubstituteVmap():    
-    var_targets = ["ax0_1", "ax1_0_0_ax2_0_0_fused_1", "ax1_0_1_ax2_0_1_fused_1", "ax1_0_2_1", "ax2_0_2_1"]
-    def _post_visit(stmt):
-        if isinstance(stmt, tir.Var) and stmt.name in var_targets:
-            # print(f"after substitute, Var is {stmt}")
-            vmap = VmapCollector.get_vmap()
-            return tvm.tir.stmt_functor.substitute(stmt, vmap)
-        return stmt
-    
-    def _ftransform(f, mod, ctx):
-        return f.with_body(
-            tvm.tir.stmt_functor.ir_transform(
-                f.body,
-                None,
-                _post_visit,
-                # ["tir.Var"]
-            )
-        )
-    
-    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
-
-
-
+# 按照pre的顺序访问ast，并打印对应信息
 def VisitAllNode():
 
     def _pre_visit(stmt):
-        print(f"Visiting node of type: {type(stmt)}")
-        print(f"Visiting node {stmt}")
+        print(f"Pre Visiting node of type: {type(stmt)}")
+        print(f"Pre Visiting node {stmt}")
         print("----------------------------------------------------------------------------------")
         return None
     
+    def _post_visit(stmt):
+        print(f"Post visiting node of type: {type(stmt)}")
+        print(f"Post visiting node {stmt}")
+        print("----------------------------------------------------------------------------------")
+        return None
+
     def _ftransform(f, mod, ctx):
         return f.with_body(
             tvm.tir.stmt_functor.ir_transform(
                 f.body,
                 _pre_visit,
-                None,
+                _post_visit,
                 # ["tir.Var"]
             )
         )
-
+    
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
 
 
@@ -412,12 +347,11 @@ class ForCollector:
     def get_for():
         return ForCollector.collected_for
 
-# 收集For node相关的信息
+# 收集For node相关的信息 ，找到第二个ax2_0_2这个for循环（因为第二次找到以后会将第一次找到的for循环覆盖掉，所以这里找到的是第2个）
 def CollectForPass():
     for_name = "ax2_0_2"
-    first_found = False
     def _pre_visit(stmt):
-        if isinstance(stmt, tir.For) and stmt.loop_var.name == for_name and not first_found :
+        if isinstance(stmt, tir.For) and stmt.loop_var.name == for_name:
             # print(stmt)
             ForCollector.collected_for = stmt
         
@@ -435,13 +369,10 @@ def CollectForPass():
     
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
 
+# 1. 找到primfunc2中 ax2_0_2 for node
+# 2. 对primfunc1中 ax2_0_2 for node进行重建，加入primfunc2 ax2_0_2 for node中
 def ParseFor():
     target_loop_var = "ax2_0_2"
-
-    def _pre_visit(stmt):
-        if isinstance(stmt, tir.For):
-            return None            
-        return stmt
 
     def _post_visit(stmt):
         if isinstance(stmt, tir.For) and stmt.loop_var.name == target_loop_var:
@@ -514,15 +445,25 @@ def RemoveSpecificForNodePass():
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
 
 
+# 删除primfunc2 ax3_0_0 for node 的Block(A_reindex_shared.dyn_1)
 def RemoveFor():
     temp_1 = 0
     temp_2 = 0
+    target_for = None
+
+    # def _pre_visit(stmt):
+    #     nonlocal target_for
+    #     if isinstance(stmt, tvm.tir.For) and stmt.loop_var.name == "ax0_ax1_ax2_fused_0":
+    #         target_for = stmt
+    #     return
+
+
     def _post_visit(stmt):
         nonlocal temp_1, temp_2
-        if stmt.loop_var.name == "ax1_0_3_init":
-            temp_1 += 1
-            if temp_1 == 2:
-                return tvm.tir.Evaluate(tvm.tir.const(0, "int32"))
+        # if stmt.loop_var.name == "ax1_0_3_init":
+        #     temp_1 += 1
+        #     if temp_1 == 2:
+        #         return tvm.tir.Evaluate(tvm.tir.const(0, "int32"))
         if stmt.loop_var.name == "ax3_0_0":
             temp_2 += 1
             if temp_2 == 2:
@@ -553,9 +494,7 @@ def RemoveFor():
         )
     
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
-
-
-
+            
 
 # can replace all the buffer(A_reindex_shared_dyn_1 -> C_reindex_shared_dyn)
 # buffer(A_reindex_shared_dyn_warp_1 -> C_reindex_shared_dyn_warp)  
@@ -589,8 +528,20 @@ def ReplaceBufferPass():
                         if write.buffer.name == "C_reindex_shared_dyn_warp":
                             target_buffers["C_reindex_shared_dyn_warp"] = write.buffer
                             break
-            
-            # Then, find the source buffers and map them to the targets
+
+            # Add new target buffer for C_reindex_shared_dyn_1
+            if "C_reindex_shared_dyn_1" not in target_buffers:
+                for read in stmt.reads:
+                    if read.buffer.name == "C_reindex_shared_dyn_1":
+                        target_buffers["C_reindex_shared_dyn_1"] = read.buffer
+                        break
+                if "C_reindex_shared_dyn_1" not in target_buffers:
+                    for write in stmt.writes:
+                        if write.buffer.name == "C_reindex_shared_dyn_1":
+                            target_buffers["C_reindex_shared_dyn_1"] = write.buffer
+                            break
+
+            # Then, find the source buffers and map them to the targets，建立buffer_map
             for read in stmt.reads:
                 if read.buffer.name == "A_reindex_shared_dyn_1":
                     if "C_reindex_shared_dyn" in target_buffers:
@@ -606,6 +557,15 @@ def ReplaceBufferPass():
                 elif write.buffer.name == "A_reindex_shared_dyn_warp_1":
                     if "C_reindex_shared_dyn_warp" in target_buffers:
                         buffer_map[write.buffer] = target_buffers["C_reindex_shared_dyn_warp"]
+            
+            # Add new replacement for C_reindex_shared.dyn block
+            if stmt.name_hint == "C_reindex_shared.dyn":
+                for read in stmt.reads:
+                    if read.buffer.name == "C_reindex_shared_dyn" and "C_reindex_shared_dyn_1" in target_buffers:
+                        buffer_map[read.buffer] = target_buffers["C_reindex_shared_dyn_1"]
+                for write in stmt.writes:
+                    if write.buffer.name == "C_reindex_shared_dyn" and "C_reindex_shared_dyn_1" in target_buffers:
+                        buffer_map[write.buffer] = target_buffers["C_reindex_shared_dyn_1"]
         return None
 
     def _post_visit(stmt):
@@ -654,6 +614,22 @@ def ReplaceBufferPass():
                     stmt.annotations
                 )
         
+        elif isinstance(stmt, tir.BufferLoad):
+            # Check if this BufferLoad uses C_reindex_shared_dyn buffer
+            if stmt.buffer.name == "C_reindex_shared_dyn" and "C_reindex_shared_dyn_1" in target_buffers:
+                # Create a new buffer with the same properties but different name
+                new_buffer = target_buffers["C_reindex_shared_dyn_1"]
+                # Create a new BufferLoad with the new buffer
+                return tir.BufferLoad(new_buffer, stmt.indices, stmt.span)
+        
+        elif isinstance(stmt, tir.BufferStore):
+            # Check if this BufferStore uses C_reindex_shared_dyn buffer
+            if stmt.buffer.name == "C_reindex_shared_dyn" and "C_reindex_shared_dyn_1" in target_buffers:
+                # Create a new buffer with the same properties but different name
+                new_buffer = target_buffers["C_reindex_shared_dyn_1"]
+                # Create a new BufferStore with the new buffer
+                return tir.BufferStore(new_buffer, stmt.value, stmt.indices, stmt.span)
+        
         return stmt
 
     def _ftransform(f, mod, ctx):
@@ -675,19 +651,57 @@ def ReplaceBufferPass():
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
             
 
+# Substitue
+def SubstituteAxis():
+    name_map = {}
+    vmap = {}
+    init_ax0 = None
+
+    def _pre_visit(stmt):
+        nonlocal name_map, vmap, init_ax0
+        target_var_name = ['ax0', 'ax1_0_0_ax2_0_0_fused', 'ax1_0_1_ax2_0_1_fused', 'ax1_0_2', 'ax2_0_2']
+
+        if isinstance(stmt, tvm.tir.For) and stmt.loop_var.name in target_var_name:
+            name_map[stmt.loop_var.name] = stmt.loop_var
+            target_var_name.remove(stmt.loop_var.name)
+            
+
+        if isinstance(stmt, tvm.tir.Var) and stmt.name in name_map:
+            if stmt != name_map[stmt.name]:
+                vmap[stmt] = name_map[stmt.name]
+        return None
+    
+    def _post_visit(stmt):
+        nonlocal vmap
+        if isinstance(stmt, tvm.tir.Var):
+            return tvm.tir.stmt_functor.substitute(stmt, vmap)
+
+        return stmt 
+        
+    def _ftransform(f, mod, ctx):
+        return f.with_body(
+            tvm.tir.stmt_functor.ir_transform(
+                f.body,
+                _pre_visit,
+                _post_visit,
+                ["tir.For", "tir.Var"]
+            )
+        )
+    
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
 
 def BlockInfo():
     def _pre_visit(stmt):
-        print(f"the Block is\n {stmt}")
-        print(f"the BLock's iter_values is {stmt.iter_vars}")
-        print(f"the Block's reads is {stmt.reads}")
-        print(f"the Block's writes is {stmt.writes}")
-        print(f"the Block's name_hint is\n {stmt.name_hint}")
-        print(f"the Block's body is\n {stmt.body}")
-        print(f"the Block's init is {stmt.init}")
-        print(f"the Block's alloc_buffers is {stmt.alloc_buffers}")
-        print(f"the Block's match_buffers is {stmt.match_buffers}")
-        print(f"the Block's annotations is {stmt.annotations}")
+        # print(f"the Block is\n {stmt}")
+        # print(f"the BLock's iter_values is {stmt.iter_vars}")
+        # print(f"the Block's reads is {stmt.reads}")
+        # print(f"the Block's writes is {stmt.writes}")
+        # print(f"the Block's name_hint is\n {stmt.name_hint}")
+        # print(f"the Block's body is\n {stmt.body}")
+        # print(f"the Block's init is {stmt.init}")
+        # print(f"the Block's alloc_buffers is {stmt.alloc_buffers}")
+        # print(f"the Block's match_buffers is {stmt.match_buffers}")
+        # print(f"the Block's annotations is {stmt.annotations}")
         print("---------------------------------------------------------------------------------------------------------------------------------")
         return None
 
@@ -697,11 +711,116 @@ def BlockInfo():
                 f.body,
                 _pre_visit,
                 None,
+                ["tir.Block", "tir.BlockRealize"]
+            )
+        )
+    
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
+
+def DelCBuffer():
+    def _post_visit(stmt):
+        if stmt.name_hint == "root":
+            new_alloc_buffer = [buf for buf in stmt.alloc_buffers if buf.name != "C_intermediate"]
+            return tvm.tir.Block(
+                iter_vars=stmt.iter_vars,
+                reads=stmt.reads,
+                writes=stmt.writes,
+                alloc_buffers=new_alloc_buffer,
+                match_buffers=stmt.match_buffers,
+                name_hint=stmt.name_hint,
+                init=stmt.init,
+                body=stmt.body,
+                annotations=stmt.annotations,
+            )
+    def _ftransform(f, mod, ctx):
+        return f.with_body(
+            tvm.tir.stmt_functor.ir_transform(
+                f.body,
+                None,
+                _post_visit,
                 ["tir.Block"]
             )
         )
     
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
+# 将C_intermediate替换成C_intermediate_1
+def LeaveBlock():
+    target_buffer = None
+
+    def _pre_visit(stmt):
+        # nonlocal target_buffer
+        # if isinstance(stmt, tir.Block) and stmt.name_hint == "root":
+        #     for buffer in stmt.alloc_buffers:
+        #         if buffer.name == "C_intermediate_1":
+        #             target_buffer[buffer.name] = stmt
+        #             print("C_intermediate_1 have been found")
+        return None
+
+    def _post_visit(stmt):
+        nonlocal target_buffer
+        if isinstance(stmt, tir.Block) and stmt.name_hint == "C_reindex_shared.dyn":
+            # 只有当我们找到了C_intermediate_1 buffer才进行替换
+            
+            # 创建新的writes列表，替换引用C_intermediate的BufferRegion
+            new_writes = []
+            for write in stmt.writes:
+                if write.buffer.name == "C_intermediate":
+                    # 创建新的BufferRegion，使用C_intermediate_1 buffer但保留原始region
+                    new_writes.append(tir.BufferRegion(
+                        target_buffer,  # 新的buffer
+                        write.region  # 保留原始region
+                    ))
+                    print(f"Replaced C_intermediate with C_intermediate_1 in writes")
+                else:
+                    new_writes.append(write)
+            
+            # 创建新的Block，只替换writes部分
+            return tir.Block(
+                iter_vars=stmt.iter_vars,
+                reads=stmt.reads,
+                writes=new_writes,  # 使用更新后的writes
+                name_hint=stmt.name_hint,
+                body=stmt.body,
+                init=stmt.init,
+                alloc_buffers=stmt.alloc_buffers,
+                match_buffers=stmt.match_buffers,
+                annotations=stmt.annotations,
+            )
+
+        if isinstance(stmt, tir.BufferStore):
+            if stmt.buffer.name == "C_intermediate":
+                # print(f"the buffer store's buffer is C_intermediate")
+                return tir.BufferStore(
+                    buffer=target_buffer,
+                    value=stmt.value,
+                    indices=stmt.indices,
+                    span=stmt.span
+                )
+        return stmt
+
+
+    def _ftransform(func, mod, ctx):
+        nonlocal target_buffer
+        for param in func.params:
+            buf = func.buffer_map[param]
+            if buf.name == "C_intermediate_1":
+                target_buffer = buf
+                print(f"found buffer")
+
+
+        return func.with_body(
+            tvm.tir.stmt_functor.ir_transform(
+                func.body,
+                _pre_visit,
+                _post_visit,
+                ["tir.Block", "tir.BufferStore"]
+            )
+        )
+
+    return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
+
 
 # Load the module
 mod = MyModule
@@ -711,32 +830,22 @@ mod = MyModule
 
 transformed_mod = CollectForPass()(mod)
 write_mod(transformed_mod, log_path, "Basic")
-# transform_mod = SubstituteVmap()(transformed_mod)
-# write_mod(transformed_mod, log_path, "SubstituteVmap")
 transformed_mod = ParseFor()(transformed_mod)
 write_mod(transformed_mod, log_path, "ParseFor")
 transformed_mod = RemoveSpecificForNodePass()(transformed_mod)
 write_mod(transformed_mod, log_path, "RemoveSpecificForNodePass")
 transformed_mod = RemoveFor()(transformed_mod)
 write_mod(transformed_mod, log_path, "RemoveFor")
-# transformed_mod = VisitAllNode()(transformed_mod)
-# transformed_mod = BlockInfo()(transformed_mod)
+
 transformed_mod = ReplaceBufferPass()(transformed_mod)
 write_mod(transformed_mod, log_path, "ReplaceBufferPass")
-
-# transformed_mod = CreateNameMap()(transformed_mod)
-# transformed_mod = CreateVmap()(transformed_mod)
-# transformed_mod = SubstituteVmap()(transformed_mod)
-# write_mod(transformed_mod, log_path, "SubstituteVmap")
-
-
-print(f"Vampcollector.name_map is {VmapCollector.name_map}")
-print(f"VmapCollector.vmap is {VmapCollector.get_vmap()}")
-# for var, mapped_var in VmapCollector.get_vmap().items():
-#     print(f"Key[id={id(var)}]: {type(var).__name__} (Name: {var.name}), "
-#           f"Value[id={id(mapped_var)}]: {type(mapped_var).__name__} "
-#           f"(Name: {mapped_var.name if hasattr(mapped_var, 'name') else 'N/A'})")
+transformed_mod = SubstituteAxis()(transformed_mod)
+write_mod(transformed_mod, log_path, "SubstituteAxis")
+transformed_mod = DelCBuffer()(transformed_mod)
+write_mod(transformed_mod, log_path, "DelCBuffer")
+transformed_mod = LeaveBlock()(transformed_mod)
+write_mod(transformed_mod, log_path, "LeaveBlock")
+# transformed_mod = VisitAllNode()(transformed_mod)
+# transformed_mod = BlockInfo()(transformed_mod)
 
 
-# print(transformed_mod.script())
-# print(f"the ForCollector.collected_for is \n{ForCollector.collected_for}")
