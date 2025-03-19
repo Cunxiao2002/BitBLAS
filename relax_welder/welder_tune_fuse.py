@@ -105,42 +105,52 @@ def create_gemm(M, N, K):
 arch = auto_infer_current_arch()
 gemm_0 = create_gemm(512, 512, 128)
 gemm_1 = create_gemm(512, 128, 512)
+gemm_2 = create_gemm(512, 128, 128)
 
 tensorized_func0, tags0 = bitblas.gpu.matmul_analysis.get_tensorized_func_and_tags(gemm_0, arch.target)
 # print(f"tags0 is {tags0}")
 tensorized_func1, tags1 = bitblas.gpu.matmul_analysis.get_tensorized_func_and_tags(gemm_1, arch.target)
 # print(f"tags1 is {tags1}")
+tensorized_func2, tags2 = bitblas.gpu.matmul_analysis.get_tensorized_func_and_tags(gemm_2, arch.target) 
+# print(f"tags2 is {tags2}")
 
+print(f"the tensorized_func0 is \n {tensorized_func0}")
 node0 = PrimFuncNode(tensorized_func0, name="matmul_0")
 node1 = PrimFuncNode(tensorized_func1, name="matmul_1")
+node2 = PrimFuncNode(tensorized_func2, name="matmul_2")
 
 edge = Edge(node0, node1, 0, 0)
 node0._out_edges.append(edge)
 node1.set_inputs(0, edge)
 
-output_nodes = [OutputNode(node1)]
+edge1 = Edge(node1, node2, 0, 0)
+node1._out_edges.append(edge1)
+node2.set_inputs(0, edge1)
+
+output_nodes = [OutputNode(node2)]
 policy = bitblas.base.policy.TensorCorePolicy.from_output_nodes(output_nodes, arch=arch, tags=tags1)
 
 hints = policy.emit_config(topk=20)
 
-
+config1 = hints[0]
 for config in hints:
     print(config)
 
 # 根据config进行schedule
 # 在relax中fuse
 # codegen
-node0_configs = [config[node0] for config in hints]
-node1_configs = [config[node1] for config in hints]
+node0_configs = [config1[node0]]
+node1_configs = [config1[node1]]
+node2_configs = [config1[node2]]
 
-# node0_cpresults, node0_best = apply_and_build(gemm_0, node0_configs, arch, parallel_build=False)
-# node1_cpresults, node1_best = apply_and_build(gemm_1, node1_configs, arch, parallel_build=False)
+node0_cpresults, node0_best = apply_and_build(gemm_0, node0_configs, arch, parallel_build=False)
+node1_cpresults, node1_best = apply_and_build(gemm_1, node1_configs, arch, parallel_build=False)
+node2_cpresults, node2_best = apply_and_build(gemm_2, node2_configs, arch, parallel_build=False)
 
 
 
 # print(node0_best.sch.mod.script())
-# write_sch(node0_best.sch, log_path, "node0_best")
-# write_sch(node1_best.sch, log_path, "node1_best")
-
-
+write_sch(node0_best.sch, log_path, "gemm0_best")
+write_sch(node1_best.sch, log_path, "gemm1_best")
+write_sch(node2_best.sch, log_path, "gemm2_best")
 
