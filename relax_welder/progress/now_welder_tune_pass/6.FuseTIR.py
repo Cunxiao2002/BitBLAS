@@ -340,7 +340,7 @@ def VisitAllNode():
 class ForCollector:
     thread_for_map = defaultdict(list)
 
-# 收集For node相关的信息 ，找到第二个ax2_0_2这个for循环（因为第二次找到以后会将第一次找到的for循环覆盖掉，所以这里找到的是第2个）
+# 建立一个thead_for_map, 后续可以用name 找到1个list，对应的是每个for node
 def CollectForPass():
     # 使用栈进行优化
     valid_thread_tags = {
@@ -366,7 +366,7 @@ def CollectForPass():
     
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
 
-# 1. 找到primfunc2中 ax2_0_2 for node
+# 1. 找到primfunc2中 ax2_0_2(theadIdx.z) for node -> 对ax2_0_2 for node的index改为blockIdx.x.body.body[0]
 # 2. 对primfunc1中 ax2_0_2 for node进行重建，加入primfunc2 ax2_0_2 for node中
 # 可以使用threadbindings进行优化
 def ParseFor():

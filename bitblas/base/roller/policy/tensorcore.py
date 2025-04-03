@@ -1,11 +1,10 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 """Policy for tensorcore schedule"""
-from bitblas import tvm
+import tvm
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 import logging
-from ...arch import TileDevice
 from ..hint import Hint, Stride, TileDict, IntrinInfo
 from ..node import PrimFuncNode
 from .common import coalesced_factor, factorize, get_all_factors
@@ -17,18 +16,17 @@ logger = logging.getLogger(__name__)
 
 class TensorCorePolicy(DefaultPolicy):
 
-    def __init__(self,
-                 func: tvm.tir.PrimFunc,
-                 arch: TileDevice,
-                 tags: Optional[Dict] = None) -> None:
-        super().__init__(func, arch, tags)
-        # this is the trick for wmma.
-        # However, for int8 mma, the wmma_k should be 32.
-        self.wmma_k = 16
-        self.pipeline_stage: int = 1
-        self.use_async_copy: bool = False
-        self.block_reduction_depth: Optional[int] = None
+    # this is the trick for wmma.
+    # However, for int8 mma, the wmma_k should be 32.
+    wmma_k: int = 16
+    pipeline_stage: int = 1
+    use_async_copy: bool = False
+    block_reduction_depth: Optional[int] = None
+
+    def _init_with_prim_func(self, func: tvm.tir.PrimFunc, name: Optional[str] = None):
+        super()._init_with_prim_func(func, name)
         self._legalize_info()
+        return self
 
     def _legalize_info(self):
         pipleline_stage = self.prim_func_node.get_tag("pipeline_stage")
@@ -184,8 +182,8 @@ class TensorCorePolicy(DefaultPolicy):
 
             for node in self.ordered_nodes:
                 if len(node.raxis) > 0:
-                    rstep = _optimize(node, rstep_map)
-                    rstep_map = rstep
+                    rstep = _optimize(node, rstep_map[node])
+                    rstep_map[node] = rstep
 
             td.rstep_map = rstep_map
             td.smem_cost, td.cached_tensors_map = self._compute_shared_memory_usage(td)
@@ -249,16 +247,24 @@ class TensorCorePolicy(DefaultPolicy):
         AS_stride, BS_stride, C_stride = self._compute_tc_strides(node, td.get_tile(node),
                                                                   td.get_rstep(node))
         A_stride, B_stride, _ = self._compute_tc_strides(node, td.get_tile(node))
-        tensor_strides = {}
         output_strides = {
-            int(i + len(node.input_buffers)): Stride() for i, _ in enumerate(node.output_buffers)
+            int(i + len(node.input_buffers)): C_stride for i, _ in enumerate(node.output_buffers)
         }
         tensor_strides = {}
         # when connected to shared input, should use full stride without rstep
-        for i, (_, _) in enumerate(zip([AS_stride, BS_stride], [A_stride, B_stride])):
+        for i, (stride, stride_full) in enumerate(zip([AS_stride, BS_stride], [A_stride, B_stride])):
             if use_layout:
                 continue
-            _ = node.block_analyzer.get_input_buffers(node.reduction_block)[i].name
+            name = node.block_analyzer.get_input_buffers(node.reduction_block)[i].name
+            tensor_strides[name] = stride
+
+            arg_names = [arg.name + "_reindex" for arg in node.args]
+            if name in arg_names:
+                input_id = arg_names.index(name)
+                src_node = node.inputs[input_id].src_node
+                if not src_node.is_placeholder():
+                    tensor_strides[name] = stride_full
+
         # TODO(lei): should dig further for shared memory connection case.
 
         return output_strides, tensor_strides
@@ -281,6 +287,9 @@ class TensorCorePolicy(DefaultPolicy):
         space = [tile[i] // wmma_tile[i] for i in range(ndim)]
         if tile[ax_m] < wmma_tile[ax_m] or tile[ax_n] < wmma_tile[ax_n]:
             # allow pad, otherwise, we can not get a valid tile shape
+            return None
+        
+        if np.prod(space) % warps != 0:
             return None
 
         factors = factorize(np.prod(space) // warps)
@@ -335,9 +344,9 @@ class TensorCorePolicy(DefaultPolicy):
         codegen_dict.shared_scope = "shared.dyn"
 
         codegen_dict.complete_config(node)
-        codegen_dict.vectorize = self._plan_vectorize(self.prim_func_node, td, block_size)
+        codegen_dict.vectorize = self._plan_vectorize(node, td, block_size)
         codegen_dict.arch = self.arch
-        codegen_dict.opt_shapes = self.prim_func_node.get_tag("opt_shapes")
+        codegen_dict.opt_shapes = node.get_tag("opt_shapes")
         codegen_dict.tensorcore_legalization()
         return codegen_dict
 

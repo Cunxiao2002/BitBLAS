@@ -79,3 +79,6 @@ models/frozenmodels/
 
 # rocprof workloads
 workloads
+
+# torch_inductor
+/torch_inductor

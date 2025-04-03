@@ -1,7 +1,5 @@
-from tvm.script import ir as I
-from tvm.script import tir as T
-from tvm.script import relax as R
-import tvm
+# from tvm.script import ir as I
+# from tvm.script import tir as T
 
 @I.ir_module
 class Module:
@@ -312,11 +310,3 @@ class Module:
                                         T.reads(C_reindex_shared_dyn_2[v0, v1, v2])
                                         T.writes(C_intermediate_1_2[v1, v2])
                                         C_intermediate_1_2[v1, v2] = C_reindex_shared_dyn_2[v0, v1, v2]
-
-target = tvm.target.Target("cuda")
-mod = Module
-for g_var, func in mod.functions_items():
-    if isinstance(func, tvm.tir.PrimFunc):
-        specalized_function = func.with_attr("global_symbol", g_var.name_hint)
-        module = tvm.build(specalized_function, target=target, name="fused_gemm")
-        print(module.imported_modules[0].get_source())

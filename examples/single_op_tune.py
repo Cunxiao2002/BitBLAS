@@ -30,7 +30,7 @@ ir_module = FusedSingleOp
 target = tvm.target.Target("cuda")
     
 with target:
-    mod = bitblas.ApplyFastTuning(topk=1)(ir_module)
+    mod = bitblas.ApplyFastTuning(topk=1, target=target)(ir_module)
 
 print(mod)
 from tvm import relax

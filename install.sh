@@ -43,39 +43,46 @@ fi
 DOWNLOAD_URL="${BASE_URL}/${FILE_NAME}"
 echo "Download URL for LLVM: ${DOWNLOAD_URL}"
 
-# Step 5: Create extraction directory
-echo "Creating extraction directory at ${EXTRACT_PATH}..."
-mkdir -p "$EXTRACT_PATH"
-if [ $? -ne 0 ]; then
-    echo "Error: Failed to create extraction directory."
-    exit 1
+LLVM_FOLDER=$(find "$EXTRACT_PATH" -maxdepth 1 -type d -name "clang+llvm*" | head -n 1)
+if [ -n "$LLVM_FOLDER" ]; then
+    echo "Found existing LLVM folder: $LLVM_FOLDER"
+    LLVM_CONFIG_PATH="$(realpath ${LLVM_FOLDER}/bin/llvm-config)"
+    echo "LLVM config path determined as: $LLVM_CONFIG_PATH"
 else
-    echo "Extraction directory created successfully."
-fi
+    # Step 5: Create extraction directory
+    echo "Creating extraction directory at ${EXTRACT_PATH}..."
+    mkdir -p "$EXTRACT_PATH"
+    if [ $? -ne 0 ]; then
+        echo "Error: Failed to create extraction directory."
+        exit 1
+    else
+        echo "Extraction directory created successfully."
+    fi
 
-# Step 6: Download LLVM
-echo "Downloading $FILE_NAME from $DOWNLOAD_URL..."
-curl -L -o "${EXTRACT_PATH}/${FILE_NAME}" "$DOWNLOAD_URL"
-if [ $? -ne 0 ]; then
-    echo "Error: Download failed!"
-    exit 1
-else
-    echo "Download completed successfully."
-fi
+    # Step 6: Download LLVM
+    echo "Downloading $FILE_NAME from $DOWNLOAD_URL..."
+    curl -L -o "${EXTRACT_PATH}/${FILE_NAME}" "$DOWNLOAD_URL"
+    if [ $? -ne 0 ]; then
+        echo "Error: Download failed!"
+        exit 1
+    else
+        echo "Download completed successfully."
+    fi
 
-# Step 7: Extract LLVM
-echo "Extracting $FILE_NAME to $EXTRACT_PATH..."
-tar -xJf "${EXTRACT_PATH}/${FILE_NAME}" -C "$EXTRACT_PATH"
-if [ $? -ne 0 ]; then
-    echo "Error: Extraction failed!"
-    exit 1
-else
-    echo "Extraction completed successfully."
-fi
+    # Step 7: Extract LLVM
+    echo "Extracting $FILE_NAME to $EXTRACT_PATH..."
+    tar -xJf "${EXTRACT_PATH}/${FILE_NAME}" -C "$EXTRACT_PATH"
+    if [ $? -ne 0 ]; then
+        echo "Error: Extraction failed!"
+        exit 1
+    else
+        echo "Extraction completed successfully."
+    fi
 
-# Step 8: Determine LLVM config path
-LLVM_CONFIG_PATH="$(realpath ${EXTRACT_PATH}/$(basename ${FILE_NAME} .tar.xz)/bin/llvm-config)"
-echo "LLVM config path determined as: $LLVM_CONFIG_PATH"
+    # Step 8: Determine LLVM config path
+    LLVM_CONFIG_PATH="$(realpath ${EXTRACT_PATH}/$(basename ${FILE_NAME} .tar.xz)/bin/llvm-config)"
+    echo "LLVM config path determined as: $LLVM_CONFIG_PATH"
+fi
 
 # Step 9: Clone and build TVM
 echo "Cloning TVM repository and initializing submodules..."

@@ -7,11 +7,12 @@ from typing import Literal, Optional, List
 
 from tvm import tir, DataType
 from tvm.target import Target
-
+import inspect
 from bitblas.base.operator_common import TransformKind
-from ..base.roller import Hint
-from ..base.roller.rasterization import NoRasterization
-from ..base import analysis
+from bitblas.base.roller import Hint
+# from ..base.roller.rasterization import NoRasterization
+from bitblas.base.roller.rasterization import NoRasterization
+from bitblas.base import analysis
 from .base import GPUScheduleRule
 from .matmul_mma_dequantize import MatmulTensorizationMMAWithDequantizeInfo
 from ..base.analysis import get_coalesced_veclen
@@ -531,7 +532,8 @@ class MatmulTensorizationMMA(GPUScheduleRule):
         # enable_store_rewrite is a hack as in some cases
         # lower vectorization factor may failed to generate
         # expected high performance code
-        enable_store_rewrite = not intrin_info.is_input_8bit()
+        # enable_store_rewrite = not intrin_info.is_input_8bit()
+        enable_store_rewrite = False
 
         def smooth_smem_layout_rewrite(block, scope, l=16, r=16, enable=True):  # noqa: E741
             if not enable:
@@ -728,8 +730,14 @@ class MatmulTensorizationMMA(GPUScheduleRule):
         if use_async:
             sch.annotate(k0, "software_pipeline_async_stages", [0])
 
+        # print(f"rasterization_plan is {config.rasterization_plan}")
+        # print(f"rasterization_plan's type is {type(config.rasterization_plan)}")
+        # print(f"isinstance's bool is {isinstance(config.rasterization_plan, NoRasterization)}")
+
         # plan rasteration
-        if not isinstance(config.rasterization_plan, NoRasterization):
+        # if not isinstance(config.rasterization_plan, NoRasterization):
+        # if config.rasterization_plan is not NoRasterization:
+        if str(config.rasterization_plan) != "<NoRasterization>":
             device_func, invoke_func = config.rasterization_plan.get_code()
             import_source.append(device_func)
             sch.annotate(
@@ -737,6 +745,10 @@ class MatmulTensorizationMMA(GPUScheduleRule):
                 ann_key="inject_customized_code_prepend",
                 ann_val=invoke_func,
             )
+        else:
+            # print(f"the config.rasterization_plan is {config.rasterization_plan}")
+            # print(f"rasterization_plan's type is {type(config.rasterization_plan)}")
+            print(f"this config NoRasterization")
         # plan import source
         if len(import_source) > 0:
             sch.annotate(

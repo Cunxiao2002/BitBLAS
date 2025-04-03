@@ -27,10 +27,32 @@ from bitblas.utils import (
 )
 from bitblas.utils.tensor_adapter import (
     np_float2np_bf16,)
+
+# from base.roller.node import Edge, OutputNode, PrimFuncNode
 import logging
 
 logger = logging.getLogger(__name__)
 
+
+# def get_roller_hints_from_output_nodes(
+#         output_nodes: List[OutputNode],
+#         arch: TileDevice,
+#         topk: int = 10,
+#         extra_tags: Optional[List[str]] = None) -> Optional[List[Hint]]:
+#     assert isinstance(output_nodes, list), "The input should be a list of functions."
+
+#     lints = []
+#     try:
+#         policy = TensorCorePolicy.from_output_nodes(output_nodes, arch=arch, tags=None)
+#         lints = policy.emit_config(topk)
+#     except Exception as e_msg:
+#         logger.debug(f"Generate hints from output nodes failed: {e_msg}",
+#                      "fallback to default policy")
+
+#     if len(lints) == 0:
+#         policy = DefaultPolicy.from_output_nodes(output_nodes, arch=arch, tags=None)
+#         lints = policy.emit_config(topk)
+#     return lints
 
 def get_rasterization_code(pannel_width: int = 8) -> str:
     return f"""
@@ -222,7 +244,7 @@ def apply_and_build_parallel(func,
                              arch,
                              num_repeats=3,
                              max_workers=10,
-                             timeout=60,
+                             timeout=1000,
                              data_distribution="uniform") -> CompileResult:
     cpresults = []
 
@@ -342,3 +364,109 @@ def apply_and_build(
     max_workers = 10 if parallel_build else 1
     return apply_and_build_parallel(
         func, configs, arch, max_workers=max_workers, data_distribution=data_distribution)
+
+def apply_and_build_single(func,
+                             configs,
+                             arch,
+                             num_repeats=3,
+                             timeout=1000,
+                             data_distribution="uniform") -> CompileResult:
+    cpresults = []
+
+    # apply config sequentially instead of in parallel
+    _sched: List[Schedule] = []
+
+    def _apply_schedule(f, c):
+        # try:
+        #     sch = _apply_config(f, c)
+        # except Exception as apply_schedule_error:
+        #     logger.debug("Apply schedule failed: {}".format(apply_schedule_error))
+        #     sch = None
+        sch = _apply_config(f, c)
+        return sch
+
+    # Apply schedules sequentially
+    for config in configs:
+        _sched.append(_apply_schedule(func, config))
+
+    # build sequentially instead of in process parallel
+    def _build(idx, mod, arch) -> tuple:
+        if mod is None:
+            return idx, None, None
+        # TODO(lei):
+        # this is a trick to implement rasteration, will be removed in the future
+        config = configs[idx]
+
+        @tvm.register_func(func_name="tvm_callback_cuda_postproc", override=True)
+        def tvm_callback_cuda_postproc(code, _):
+            code = tensor_replace_dp4a(code)
+            code = tensor_remove_make_int4(code)
+            code = tensor_remove_make_int2(code)
+            return code
+
+        try:
+            with tvm.transform.PassContext(config={
+                    "tir.use_async_copy": True,
+                    "tir.disable_cse_tir": True,
+                    **config.pass_context
+            }):
+                rt_mod = tvm.build(mod, target=arch.target)
+
+            from tvm.contrib.tar import tar  # pylint: disable=import-outside-toplevel
+
+            artifact_path = os.path.join(tempfile.mkdtemp(), "tvm_tmp_mod." + tar.output_format)
+            code = rt_mod.imported_modules[0].get_source()
+            rt_mod.export_library(artifact_path, fcompile=tar)
+            return idx, code, artifact_path
+        except Exception as e:
+            local_build_error = str(e)
+            if len(local_build_error) > MAX_ERROR_MESSAGE_LENGTH:
+                local_build_error = (
+                    local_build_error[:MAX_ERROR_MESSAGE_LENGTH // 2] + "\t...\t" +
+                    local_build_error[-MAX_ERROR_MESSAGE_LENGTH // 2:])
+            logger.debug("LocalBuilder: An exception occurred {}".format(local_build_error))
+            return idx, None, None
+
+    _mods = [sch.mod if sch is not None else None for sch in _sched]
+
+    # Process each module sequentially
+    for i, mod in enumerate(_mods):
+        result = _build(i, mod, arch)
+        if result is None:
+            continue
+            
+        idx, code, artifact_path = result
+        if artifact_path is None:
+            config = configs[idx]
+            ARTIFACT_NOT_FOUND = f"Apply config {config} failed, artifact path is None"
+            logger.debug(ARTIFACT_NOT_FOUND)
+            continue
+            
+        sch = _sched[idx]
+        config = configs[idx]
+        rt_mod = tvm.runtime.load_module(artifact_path)
+        cpresult = CompileResult(config, sch, rt_mod)
+        timer_cuda_mod = rt_mod.time_evaluator(
+            rt_mod.entry_name, arch.device, number=num_repeats)
+        cpresult.time_evaluator = timer_cuda_mod
+        cpresult.code = code
+        cpresults.append(cpresult)
+
+    best = None
+    best_latency = 1e9
+    for cpresult in cpresults:
+        config = cpresult.config
+        try:
+            latency = cpresult.profile(data_distribution=data_distribution)
+        except Exception as e_mesg:
+            logger.debug(f"Evaluation with config failed {e_mesg}")
+            continue
+        logger.info("Evaluation with config {}".format(config))
+        logger.info("Time cost of this config: {:.3f} ms".format(latency))
+
+        cpresult.latency = latency
+        if latency < best_latency:
+            best_latency = latency
+            best = cpresult
+
+    return cpresults, best

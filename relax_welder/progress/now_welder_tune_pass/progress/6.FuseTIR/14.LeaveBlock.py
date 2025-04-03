@@ -218,7 +218,7 @@ class Module:
                                         v2 = T.axis.spatial(512, (ax0_ax1_ax2_fused_0 * 256 + ax0_ax1_ax2_fused_1 * 8 + ax0_ax1_ax2_fused_2) % 512)
                                         T.reads(C_reindex_shared_dyn_1[v0, v1, v2])
                                         T.writes(C_intermediate_1[v1, v2])
-                                        C_intermediate_1[v1, v2] = C_reindex_shared_dyn_1[v0, v1, v2]
+                                        C_intermediate_1[v1, v2] = C_reindex_shared_dyn[v0, v1, v2]
 
     @R.function
     def main(A: R.Tensor((512, 128), dtype="float16"), B: R.Tensor((128, 512), dtype="float16"), D: R.Tensor((512, 128), dtype="float16"), E: R.Tensor((512, 128), dtype="float16")) -> R.Tensor((512, 128), dtype="float16"):

@@ -65,7 +65,7 @@ def write_mod(mod, path, fname):
 from tvm.relay.frontend.onnx import from_onnx
 import onnx
 
-model_path = "/root/BitBLAS/examples/NeRF-b128/model.onnx"
+model_path = "/workspace/BitBLAS/examples/NeRF/model.onnx"
 onnx_model = onnx.load(model_path)
 relay_mod, params = from_onnx(onnx_model)
 

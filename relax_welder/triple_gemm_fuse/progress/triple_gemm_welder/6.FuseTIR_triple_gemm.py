@@ -837,7 +837,7 @@ def VisitAllNode():
 
 class ForCollector:
     thread_for_map = defaultdict(list)
-    num_func = 0
+    num_func = 0 #该参数用于检查有几个block
 
 # 建立一个thead_for_map, 后续可以用name 找到1个list，对应的是每个for node
 def CollectForPass():
@@ -869,6 +869,7 @@ def CollectForPass():
 
 
 # 对primfunc1中 ax2_0_2 for node进行重建，把primfunc2 ax2_0_2 for node加入到primfunc1中
+# 将primfunc2 ax2_0_2 改成 ax1_0_2
 def ReconstructionPrim():
     thread_for_map = ForCollector.thread_for_map
 

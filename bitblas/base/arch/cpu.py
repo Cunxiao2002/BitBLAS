@@ -1,7 +1,7 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from bitblas import tvm
+import tvm
 from tvm.target import Target
 from .arch_base import TileDevice
 
