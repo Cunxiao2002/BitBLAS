@@ -1,17 +1,16 @@
-from base.arch import auto_infer_current_arch
-from base.roller.node import PrimFuncNode
-from base.roller.policy.tensorcore import TensorCorePolicy
+from bitblas.base.arch import auto_infer_current_arch
+from bitblas.base.roller.node import PrimFuncNode
+from bitblas.base.roller.policy.tensorcore import TensorCorePolicy
 import tvm
 from tvm.script import ir as I
 from tvm.script import tir as T
 from tvm.script import relax as R
 import bitblas
-from bitblas.base.arch import auto_infer_current_arch
 from bitblas.base import fast_tune
 from tvm.tir.function import PrimFunc
 from bitblas.base.utils import apply_and_build, apply_and_build_single
-from base.roller import hint
-from base.roller.node import Edge, OutputNode, PrimFuncNode
+from bitblas.base.roller import hint
+from bitblas.base.roller.node import Edge, OutputNode, PrimFuncNode
 from collections import deque
 import os
 from tvm import relax
@@ -26,7 +25,7 @@ import torch.nn.functional as F
 fname = os.path.basename(__file__)
 fname = os.path.splitext(fname)[0]
 # get current file path
-log_path = os.path.dirname(os.path.abspath(__file__)) + "/progress/" + fname
+log_path = os.path.dirname(os.path.abspath(__file__)) + "/progress_test_1/" + fname
 
 count = 0
 
@@ -125,11 +124,9 @@ class Module:
             lv3 = R.call_tir(cls.fused_dense_relu, (lv2, param_3), out_sinfo=R.Tensor((2073600, 64), dtype="float16"))
             lv4 = R.call_tir(cls.fused_dense_relu, (lv3, param_4), out_sinfo=R.Tensor((2073600, 64), dtype="float16"))
             lv5 = R.call_tir(cls.fused_dense_relu, (lv4, param_5), out_sinfo=R.Tensor((2073600, 64), dtype="float16"))
-            gv = R.call_tir(cls.fused_dense1_strided_slice, (lv5, param_6), out_sinfo=R.Tensor((2073600, 3), dtype="float16"))
-            R.output(gv)
-        return gv
-
-
+            # gv = R.call_tir(cls.fused_dense1_strided_slice, (lv5, param_6), out_sinfo=R.Tensor((2073600, 3), dtype="float16"))
+            R.output(lv5)
+        return lv5
 
 
 class WelderTunePass:
@@ -178,20 +175,6 @@ class WelderTunePass:
         config = hints[0]
 
 
-
-
-# 测试两个fused_dense_relu能否放在一起来tune
-# mod = Module
-# for g_var, func in mod.functions_items():
-#     if isinstance(func, tvm.tir.PrimFunc):
-#         func.with_attr("global_symbol", g_var.name_hint)
-#         dense = func
-
-# dense = Module['fused_dense_relu']
-
-# write_sch(best_0.sch, log_path, "fused_dense_relu_0_best")
-# write_sch(best_1.sch, log_path, "fused_dense_relu_1_best")
-
 @tvm.relax.expr_functor.visitor
 class TileGraphExtractor(relax.PyExprVisitor):
     def __init__(self, mod: tvm.IRModule):
@@ -219,7 +202,7 @@ class TileGraphExtractor(relax.PyExprVisitor):
 
 
 class FusionGroup:
-    def __init__(self, node_list: List[PrimFuncNode], latency,compile_result=None):
+    def __init__(self, node_list: List[PrimFuncNode], latency, compile_result=None):
         self.node_list = node_list
         self.compile_result = compile_result
         self.latency = latency
@@ -234,22 +217,20 @@ node_map = extractor.node_map #节点名称->relax call的映射
 
 # 输入两个primfunc
 # 首先要创建1个dataflow
-# 
-
 def create_dataflow(func0, func1, arch):
     func0 = func0.with_attr("target", arch.target)
     func1 = func1.with_attr("target", arch.target)
     mod = tvm.IRModule({func0.attrs["global_symbol"]: func0, func1.attrs["global_symbol"]: func1})
     
     # 调用MakePackedAPI()前需要补充target
-    mod = tvm.tir.transform.MakePackedAPI()(mod)
+    # mod = tvm.tir.transform.MakePackedAPI()(mod)
     func0_gvar = mod.get_global_var(func0.attrs["global_symbol"])
     func1_gvar = mod.get_global_var(func1.attrs["global_symbol"])
 
     func0_input_buffer = func0.buffer_map[func0.params[0]]
     func0_output_buffer = func0.buffer_map[func0.params[-1]]
-    func0_param_buffer = func0.buffer_map[func0.params[1]]
-
+    # func0_param_buffer = func0.buffer_map[func0.params[1]]
+    func0_param_buffer = [func0.buffer_map[param] for param in func0.params[1:-1]]
 
     func1_param_buffer = func1.buffer_map[func1.params[1]]
     func1_output_buffer = func1.buffer_map[func1.params[-1]]
@@ -260,18 +241,29 @@ def create_dataflow(func0, func1, arch):
     # Get the input parameter
     input_var = relax.Var("input", relax.TensorStructInfo(func0_input_buffer.shape, func0_input_buffer.dtype))
 
-    func0_param_var = relax.Var("param_func0", relax.TensorStructInfo(func0_param_buffer.shape, func0_param_buffer.dtype))
+    # func0_param_var = relax.Var("param_func0", relax.TensorStructInfo(func0_param_buffer.shape, func0_param_buffer.dtype))
+    func0_param_vars = []
+    for i, param_buffer in enumerate(func0_param_buffer):
+        param_var = relax.Var(
+            f"param_func0_{i}",
+            relax.TensorStructInfo(param_buffer.shape, param_buffer.dtype)
+        )
+        func0_param_vars.append(param_var)
+    
 
     func1_param_var = relax.Var("param_func1", relax.TensorStructInfo(func1_param_buffer.shape, func1_param_buffer.dtype))
+
+    all_params = [input_var] + func0_param_vars + [func1_param_var]
     
     # Define the main function
-    with builder.function("main", [input_var, func0_param_var, func1_param_var]):
+    with builder.function("main", all_params):
         with builder.dataflow():        
             # Call func0
             cls = mod
+            func0_args = [input_var] + func0_param_vars
             func0_output = builder.emit(relax.call_tir(
                 func0_gvar, 
-                [input_var, func0_param_var],
+                func0_args,
                 relax.TensorStructInfo(func0_output_buffer.shape, func0_output_buffer.dtype)
             ))
             
@@ -313,20 +305,17 @@ def fuse_node(func0, func1, arch) -> tvm.IRModule:
     # 找到FuseTIR以后的primfunc
     fused_name = "fused_" + str(func0.attrs["global_symbol"]) + '_' + str(func1.attrs["global_symbol"])
     target_func = relax_mod[fused_name]
-    target_func = target_func.with_attr({"global_symbol": fused_name})
+    target_func = target_func.with_attr({"global_symbol": "Fused"})
     
-    # for func in relax_mod.functions:
-    #     if func.name_hint == "fused_" + str(func0.attrs["global_symbol"]) + '_' + str(func1.attrs["global_symbol"]):
-    #         target_func = func
-    
-    target_mod = tvm.IRModule({target_func.attrs["global_symbol"]: target_func})
+    before_fuse_mod = tvm.IRModule({target_func.attrs["global_symbol"]: target_func})
     
     # 对其使用FuseSharedMemory pass
-    target_mod = tvm.script.from_source(target_mod.script())
-    target_mod = FuseSharedMemory(target_mod)
-    write_mod(target_mod, log_path, "FuseSharedMemory")
+    before_fuse_mod = tvm.script.from_source(before_fuse_mod.script())
+    write_mod(before_fuse_mod, log_path, "BeforeFuseSharedMemory_test_1")
+    after_fuse_mod = FuseSharedMemory(before_fuse_mod)
+    write_mod(after_fuse_mod, log_path, "AfterFuseSharedMemory_test_1")
 
-    return target_mod
+    return after_fuse_mod
 
 # 将tvm ndarray转变成torch tensor
 def tvm_to_torch(tvm_arrays):
@@ -348,16 +337,9 @@ def forward_compute(tensors):
     # tensors[0]: input tensor of shape (2073600, 64)
     # tensors[1] and tensors[2]: weight matrices of shape (64, 64)
     
-    # First gemm: matrix multiplication between first two tensors
     gemm1 = torch.matmul(tensors[0], tensors[1].T)
-    
-    # First relu activation
     relu1 = F.relu(gemm1)
-    
-    # Second gemm: matrix multiplication with third tensor
     gemm2 = torch.matmul(relu1, tensors[2].T)
-    
-    # Second relu activation
     relu2 = F.relu(gemm2)
     
     return relu2
@@ -391,7 +373,77 @@ def compute_latency(mod, arch, data_distribution="uniform", num_repeats=3):
 
     return latency
 
-    
+
+# 创建新的primfunc node
+def create_new_primfunc_node(primfunc, name, arch):
+    tensorized_func, tags = bitblas.gpu.matmul_analysis.get_tensorized_func_and_tags(primfunc, arch.target)
+    return PrimFuncNode(tensorized_func, name=name), tags
+
+
+# 使用config进行build
+# 找所有config中最快的1组
+def build_with_configs(hints, prepared_nodes, arch):
+    # best_no_fuse_latency = float('inf')
+    best_latency = 100000
+    best_config = None
+    global_current_best = None
+    global_next_best = None
+
+    best_results = [None] * len(prepared_nodes)
+
+    for config in hints:
+        current_latency = 0
+        current_results = []
+        valid_config = True
+
+        for node in prepared_nodes:
+            _, node_best = apply_and_build_single(node.prim_func, [config[node]], arch=arch)
+
+            if node_best is None:
+                valid_config = False
+                break
+
+            current_latency += node_best.latency
+            current_results.append(node_best)
+
+        if not valid_config:
+            continue
+            
+        if current_latency < best_latency:
+            best_latency = current_latency
+            best_config = config
+            best_results = current_results
+        
+    return best_config, best_latency, best_results
+
+
+# 创建fuse policy
+def create_fuse_policy(ordered_nodes, arch):
+    prepared_nodes = []
+    tags_list = []
+
+    for node in ordered_nodes:
+        prepared_node, tags = create_new_primfunc_node(node.prim_func, node.name, arch)
+        prepared_nodes.append(prepared_node)
+
+        tags["tensorcore_config"] = [0, 1]
+        tags_list.append(tags)
+
+    # connect with edges
+    for i in range(len(prepared_nodes) - 1):
+        current_node = prepared_nodes[i]
+        next_node = prepared_nodes[i + 1]
+
+        edge = Edge(current_node, next_node, 0, 0)
+        current_node._out_edges.append(edge)
+        next_node.set_inputs(0, edge)
+
+    output_node = OutputNode(prepared_nodes[-1])
+
+    policy = TensorCorePolicy.from_output_nodes([output_node], arch=arch, tags=tags_list[-1])
+
+    return policy, prepared_nodes
+
     
 
 # 从这个top_node开始往后构建fusion_group
@@ -399,52 +451,29 @@ def compute_latency(mod, arch, data_distribution="uniform", num_repeats=3):
 def build_fusion_group(top_node, arch) -> FusionGroup:
     idx = ordered_nodes.index(top_node)
     fusion_group = [top_node]
+    cur_group = []
     current_total_latency = 0
+    current_prepared = None
+    global_best_latency = float('inf')
 
-    current_fused_func, tags_current = bitblas.gpu.matmul_analysis.get_tensorized_func_and_tags(top_node.prim_func, arch.target)
-    current_prepared = PrimFuncNode(current_fused_func, name=top_node.name)
+    fused_mod = None
 
     while(idx + 1) < len(ordered_nodes):
         next_node = ordered_nodes[idx + 1]
 
-        tensorized_next, tags_next = bitblas.gpu.matmul_analysis.get_tensorized_func_and_tags(next_node.prim_func, arch.target)
-        next_prepared = PrimFuncNode(tensorized_next, name=next_node.name)
+        policy, prepared_nodes = create_fuse_policy(fusion_group + [next_node], arch)
 
-        edge = Edge(current_prepared, next_prepared, 0, 0)
-        current_prepared._out_edges.append(edge)
-        next_prepared.set_inputs(0, edge)
+        if current_prepared is None:
+            current_prepared = prepared_nodes[0]
 
-        output_node = OutputNode(next_prepared)
-
-        tags_next["tensorcore_config"] = [0, 1]
-        policy = TensorCorePolicy.from_output_nodes([output_node], arch=arch, tags=tags_next)
-        # policy = TensorCorePolicy.from_output_nodes([output_node], arch=arch)
         hints = policy.emit_config(topk=1)
 
         # 找到最优的config
         best_config = None
-        best_no_fuse_latency = 1000000
-        global_current_best = None
-        global_next_best = None
-
         for config in hints:
             print(config)
-        
-        for config in hints:
-            _, current_best = apply_and_build_single(current_prepared.prim_func, [config[current_prepared]], arch=arch)
-            
-            _, next_best = apply_and_build_single(next_prepared.prim_func, [config[next_prepared]], arch=arch)
 
-            if current_best is None or next_best is None:
-                continue
-
-            no_fuse_latency = current_best.latency + next_best.latency
-            
-            if no_fuse_latency < best_no_fuse_latency:
-                best_no_fuse_latency = no_fuse_latency
-                best_config = config
-                global_current_best = current_best
-                global_next_best = next_best
+        best_config, best_no_fuse_latency, best_results = build_with_configs(hints, prepared_nodes, arch)
             
         if best_config is None:
             break
@@ -452,22 +481,28 @@ def build_fusion_group(top_node, arch) -> FusionGroup:
             print(f"the best config is {best_config}")
         
         # 进行fuse并判断fuse的结果
-        # fused_mod = fuse_node(current_prepared.prim_func, next_prepared.prim_func)
-        fused_mod = fuse_node(global_current_best.sch.mod["main"], global_next_best.sch.mod["main"], arch=arch)
+        if fused_mod is None:
+            fused_mod = fuse_node(best_results[0].sch.mod["main"], best_results[-1].sch.mod["main"], arch=arch)
+        else:
+            fused_mod = fuse_node(fused_mod["Fused"], best_results[-1].sch.mod["main"], arch=arch)
         fused_latency = compute_latency(fused_mod, arch)
 
         if fused_latency < best_no_fuse_latency:
-            current_total_latency = fused_latency
-            current_fused_mod = fused_mod
+            global_best_latency = fused_latency
+            global_best_mod = fused_mod
             fusion_group.append(next_node)
 
             idx += 1
-            # (TODO-xiao)这里通过current_fused_mod重新构建primfunc有点问题，后续需要重新check
-            current_prepared = PrimFuncNode(current_fused_mod.primfunc, name=next_node.name)
+
+            current_prepared = prepared_nodes[-1]
+            
         else:
             break
+    
+    print(f"the best latency is {global_best_latency}")
+    print(f"the fusion group is {fusion_group}")
 
-    return FusionGroup(fusion_group, latency=current_total_latency)
+    return FusionGroup(fusion_group, latency=global_best_latency)
 
         
             
