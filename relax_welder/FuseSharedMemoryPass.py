@@ -5,6 +5,40 @@ import tvm
 from tvm import tir
 from collections import defaultdict
 
+
+############ debug
+import os
+fname = os.path.basename(__file__)
+fname = os.path.splitext(fname)[0]
+# get current file path
+log_path = os.path.dirname(os.path.abspath(__file__)) + "/welder_fuse_log/" + fname
+count = 0
+
+def write_code(code, path, fname):
+    global count
+    fname = str(count) + "." + fname
+    count += 1
+    if not os.path.exists(path):
+        os.makedirs(path)
+    fname = os.path.join(path, fname)
+    with open(fname, "w") as f:
+        f.write(code)
+
+
+def write_sch(sch, path, fname):
+    py_fname = fname + ".py"
+    write_code(sch.mod["main"].script(), path, py_fname)
+    cu_fname = fname + ".cu"
+    write_code(sch.mod.astext(), path, cu_fname)
+
+
+def write_mod(mod, path, fname):
+    py_fname = fname + ".py"
+    write_code(mod.script(show_meta=False), path, py_fname)
+    cu_fname = fname + ".cu"
+    write_code(mod.astext(show_meta_data=False), path, cu_fname)
+############
+
 def VisitAllNode():
 
     def _pre_visit(stmt):
@@ -101,6 +135,7 @@ def RemoveUselessFunc():
     thread_for_map = defaultdict(list)
     init_A_node = []
     for for_node in thread_for_map["blockIdx.x"][1:]:
+        # 找init_A_node
         init_A_node.append(for_node.body.body[0].body[1].body[0])
 
     valid_thread_tags = {
@@ -204,17 +239,24 @@ def ReplaceBufferPass():
             func_buffers = {}
             for i in range(num_func):
                 func_buffers[f"func{i}"] = []
+
+            # 找到最大的suffix
+            max_suffix = -1
+            for buffer in alloc_buffers_list:
+                suffix = extract_suffix(buffer.name)
+                if suffix is not None and suffix > max_suffix:
+                    max_suffix = suffix
             
             for buffer in alloc_buffers_list:
                 buffer_name = buffer.name
                 suffix = extract_suffix(buffer_name)
-                pre_fix = extract_prefix(buffer_name)
+                # pre_fix = extract_prefix(buffer_name)
 
                 if suffix is not None:
-                    func_idx = f"func{suffix}"
-
-                    if suffix < num_func:
-                        func_buffers[func_idx].append(buffer)
+                    if suffix == max_suffix:
+                        func_buffers["func1"].append(buffer)
+                    else:
+                        func_buffers["func0"].append(buffer)
                 else:
                     func_buffers['func0'].append(buffer)
             
@@ -670,14 +712,25 @@ def SolveSwizzleProblem():
     return tvm.tir.transform.prim_func_pass(_ftransform, opt_level=0)
 
 
-# @tvm.tir.transform.prim_func_pass(opt_level=0)
+# @tvm.tir.transform.prim_func_pass(opt_level=0)                                            
 def FuseSharedMemory(mod):
     mod = CollectForPass()(mod)
+    write_mod(mod, log_path, "CollectForPass")
     mod = ReconstructionPrim()(mod)
+    write_mod(mod, log_path, "ReconstructionPrim")
     mod = RemoveInit_A()(mod)
+    write_mod(mod, log_path, "RemoveInit_A")
     mod = RemoveUselessFunc()(mod)
+    write_mod(mod, log_path, "RemoveUselessFunc")
     mod = SubstituteAxis()(mod)
+    write_mod(mod, log_path, "SubstituteAxis")
     mod = ReplaceBufferPass()(mod)
+    write_mod(mod, log_path, "ReplaceBufferPass")
     mod = ReluBufferReplace()(mod)
+    write_mod(mod, log_path, "ReluBufferReplace")
     mod = SolveSwizzleProblem()(mod)
+    write_mod(mod, log_path, "SolveSwizzleProblem")
+
+    ForCollector.thread_for_map.clear()
+    ForCollector.num_func = 0
     return mod
